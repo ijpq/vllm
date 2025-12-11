@@ -1072,6 +1072,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return output
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
+            breakpoint()
             from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 triton_kernel_moe_forward,
             )

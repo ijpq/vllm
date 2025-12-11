@@ -87,8 +87,6 @@ def pack_bitmatrix(
 @triton.jit
 def _topk_softmax_kernel(
     logits_ptr,
-    weights_ptr,
-    indices_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
     topk: tl.constexpr,
@@ -98,15 +96,35 @@ def _topk_softmax_kernel(
     stride_wk,
     stride_im,
     stride_ik,
+<<<<<<< Updated upstream
     RENORM: tl.constexpr,
     ROWS_PER_PID: tl.constexpr,
     num_stages: tl.constexpr,
+=======
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    RENORM: tl.constexpr,
+    ROWS_PER_PID: tl.constexpr,
+    num_stages: tl.constexpr,
+    USE_BITONIC: tl.constexpr,
+    bm_cols: tl.constexpr,
+    weights_ptr,
+    indices_ptr,
+    bitmatrix
+>>>>>>> Stashed changes
 ):
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
 
+<<<<<<< Updated upstream
     offs_n = tl.arange(0, N)
     offs_k = tl.arange(0, topk)
+=======
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, topk)
+    mask_n = offs_n < N
+    warp_size: tl.constexpr = 32
+>>>>>>> Stashed changes
 
     # impl topk<=2 and RENORM specialization by tl.constexpr,
     # same as constexpr if in C++17
@@ -119,20 +137,35 @@ def _topk_softmax_kernel(
         num_stages,
         warp_specialize=True,
     ):
+<<<<<<< Updated upstream
         topk_vals = tl.full([ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32)
+=======
+        topk_vals = tl.full(
+            [ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32
+        )
+>>>>>>> Stashed changes
         topk_idxs = tl.zeros([ROWS_PER_PID, topk], dtype=tl.int32)
         row_indices = row_idx + rows  # [ROWS_PER_POD,]
         row_mask = row_indices < M
 
         # broadcast to [ROWS_PER_PID, BLOCKN]
         ptr_off = (
+<<<<<<< Updated upstream
             logits_ptr + row_indices[:, None] * stride_lm + offs_n[None, :] * stride_ln
         )
         logits = tl.load(ptr_off, mask=row_mask[:, None], other=float("-inf"))
+=======
+            logits_ptr
+            + row_indices[:, None] * stride_lm
+            + offs_n[None, :] * stride_ln
+        )
+        logits = tl.load(ptr_off)
+>>>>>>> Stashed changes
 
         if not RENORM:
             logits = tl.softmax(logits, dim=1, keep_dims=True)
 
+<<<<<<< Updated upstream
         # XXX: may use topk from triton_kernels
         for k in tl.static_range(topk):
             cur_max = tl.max(logits, axis=1, keep_dims=True)  # [ROWS_PER_PID, 1]
@@ -165,13 +198,111 @@ def _topk_softmax_kernel(
             topk_idxs,
             mask=row_mask[:, None],
         )
+=======
+        if USE_BITONIC:
+            # TODO(ijpq): we should enable this sort when N <= warp_size,
+            # but need align tensor's layout with warp.
+            # leverage PTX to sort warp_size experts to bypass sharedmemory
+            idx = tl.arange(0, warp_size)[None, :]
+            idxs = tl.broadcast_to(idx, (ROWS_PER_PID, warp_size))
+            sorted_val, sorted_idx = bitonic_sort_warp_size_descending(
+                val=logits, idx=idxs
+            )  # [ROWS_PER_PID, 32]
+            tl.static_assert(sorted_val.shape == (ROWS_PER_PID, warp_size))
+        else:
+            # XXX: may use triton_kernels's topk, but require aligning it with argsort's semantic
+            for k in tl.static_range(topk):
+                cur_max = tl.max(
+                    logits, axis=1, keep_dims=True
+                )  # [ROWS_PER_PID, 1]
+                cur_idx = tl.argmax(logits, axis=1, keep_dims=True)
+
+                k_mask = offs_k == k
+                topk_vals = tl.where(
+                    k_mask, cur_max, topk_vals
+                )  # [ROWS_PER PID, 1], [ROWS_PER PID, topkpadded]
+                topk_idxs = tl.where(k_mask, cur_idx, topk_idxs)
+
+                mask_selected = (
+                    cur_idx == offs_n[None, :]
+                )  # [ROWSPERPID,1] [1,BLOCKN]
+                logits = tl.where(mask_selected, float("-inf"), logits)
+
+        if RENORM:
+            if USE_BITONIC:
+                topk_col_mask = (
+                    tl.arange(0, warp_size)[None, :] < topk
+                )  # [1, warp_size]
+                masked_val = tl.where(topk_col_mask, sorted_val, float("-inf"))
+                masked_val = tl.softmax(masked_val, dim=1)
+                sorted_val = tl.where(topk_col_mask, masked_val, sorted_val)
+            else:
+                topk_vals = topk_vals - tl.max(
+                    topk_vals, axis=1, keep_dims=True
+                )  # [ROWSPERPID, topkpadded] - [ROWSPERPID,1]
+                numerator = tl.exp(topk_vals)
+                denominator = tl.sum(
+                    numerator, axis=1, keep_dims=True
+                )  # [ROWSPERPID,1]
+                topk_vals = numerator / denominator  # [ROWSPERPID,topkpadded]
+
+        # pack bitmatrix
+        offset_blocksizek = tl.arange(0, BLOCK_SIZE_K)
+        experts_group = 32
+        div = topk_idxs // experts_group
+        rem = indices % experts_group
+        one = tl.cast(1, tl.uint32)
+        for i in static_range(bm_cols):
+            offs = tl.arange(0, BLOCK_SIZE_K // experts_group) + i * (BLOCK_SIZE_K // experts_group)
+            x = tl.where(
+                div[:, :, None] == offs[None, None, :], (one << rem)[:, :, None], 0)
+            y = tl.reduce_or(x, axis=1) # [ROWS_PERPID, BLOCK_SIZE_K//experts_group]
+            bitmatrix_ptrs = bitmatrix + row_indices[:, None] * bm_cols + offs[None, :]
+            tl.store(bitmatrix_ptrs, y, mask=row_mask)
+        if USE_BITONIC:
+
+        else:
+>>>>>>> Stashed changes
 
 
-def fused_topk_softmax(
+        # Final WB
+        if USE_BITONIC:
+            offs_warp_size = tl.arange(0, warp_size)
+            store_col_mask = offs_warp_size < topk
+            tl.store(
+                weights_ptr
+                + row_indices[:, None] * stride_wm
+                + offs_warp_size[None, :] * stride_wk,
+                sorted_val,
+                mask=row_mask[:, None] & store_col_mask[None, :],
+            )
+            tl.store(
+                indices_ptr
+                + row_indices[:, None] * stride_im
+                + offs_warp_size[None, :] * stride_ik,
+                sorted_idx,
+                mask=row_mask[:, None] & store_col_mask[None, :],
+            )
+        else:
+            tl.store(
+                weights_ptr
+                + row_indices[:, None] * stride_wm  # [ROWSPERPID,1]
+                + offs_k[None, :] * stride_wk,  # [1, topkpadded]
+                topk_vals,
+            )
+            tl.store(
+                indices_ptr
+                + row_indices[:, None] * stride_im
+                + offs_k[None, :] * stride_ik,
+                topk_idxs,
+            )
+
+
+def fused_routing(
     router_logits: torch.Tensor,
     topk: int,
     renormalize: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
     M, N = router_logits.shape  # num_tokens, num_experts
     weights = torch.empty(
         (M, topk), device=router_logits.device, dtype=router_logits.dtype
@@ -180,14 +311,24 @@ def fused_topk_softmax(
 
     BLOCK_N = triton.next_power_of_2(N)  # num_padded_experts
     topk_padded = triton.next_power_of_2(topk)
+<<<<<<< Updated upstream
     assert (BLOCK_N == N) and (topk_padded == topk)
+=======
+    BLOCK_M = triton.next_power_of_2(M)
+    warp_size = 32
+    assert(BLOCK_N == N and topk_padded == topk, "only num_experts and topk is power of 2 is expected")
+
+    BLOCK_SIZE_K = 32
+    bm_cols = triton.cdiv(N, BLOCK_SIZE_K)
+    bitmatrix = torch.zeros(
+        (M, bm_cols), dtype=torch.uint32, device=router_logits.device
+    )
+>>>>>>> Stashed changes
 
     grid = lambda META: (triton.cdiv(M, META["ROWS_PER_PID"]),)
 
     _topk_softmax_kernel[grid](
         logits_ptr=router_logits,
-        weights_ptr=weights,
-        indices_ptr=indices,
         M=M,
         N=N,
         topk=topk,
@@ -197,10 +338,30 @@ def fused_topk_softmax(
         stride_wk=weights.stride(1),
         stride_im=indices.stride(0),
         stride_ik=indices.stride(1),
+<<<<<<< Updated upstream
         RENORM=renormalize,
+=======
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        RENORM=renormalize,
+        USE_BITONIC=(warp_size == N),
+        bm_cols=bm_cols,
+        weights_ptr=weights,
+        indices_ptr=indices,
+        bitmatrix=bitmatrix,
+>>>>>>> Stashed changes
     )
 
-    return weights, indices
+    bitmatrix_shape = [M, bm_cols * BLOCK_SIZE_K]
+    bitmatrix_shape_max[M, None]
+    bitmatrix = Bitmatrix(
+        bitmatrix, shape=bitmatrix_shape, shape_max=bitmatrix_shape_max, scratchpad=None
+    )
+    routing_data, gather_indx, scatter_indx = routing_from_bitmatrix(
+        bitmatrix, topk_weights, topk_ids, num_local_experts, num_topk
+    )
+
+    return routing_data, gather_idx, scatter_indx
 
 
 def triton_kernel_moe_forward(
@@ -216,10 +377,11 @@ def triton_kernel_moe_forward(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    topk_weights, topk_indices = fused_topk_softmax(gating_output, topk, renormalize)
-    routing_data, gather_idx, scatter_idx = make_routing_data(
-        topk_indices, topk_weights, num_local_experts=gating_output.shape[-1]
-    )
+    breakpoint()
+    topk_weights, topk_indices = fused_routing(gating_output, topk, renormalize)
+    # routing_data, gather_idx, scatter_idx = make_routing_data(
+    #     topk_indices, topk_weights, num_local_experts=gating_output.shape[-1]
+    # )
 
     output = torch.empty_like(hidden_states)
 
