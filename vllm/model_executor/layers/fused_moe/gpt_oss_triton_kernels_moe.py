@@ -3,7 +3,7 @@
 
 
 import torch
-
+from torch.profiler import record_function  # [新增] 导入 record_function
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -87,27 +87,28 @@ def triton_kernel_moe_forward(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    routing_data, gather_idx, scatter_idx = routing(
-        gating_output, topk, sm_first=not renormalize
-    )
+    with record_function("triton_kernel_moe_forward"):
+        routing_data, gather_idx, scatter_idx = routing(
+            gating_output, topk, sm_first=not renormalize
+        )
 
-    output = torch.empty_like(hidden_states)
+        output = torch.empty_like(hidden_states)
 
-    return triton_kernel_fused_experts(
-        output,
-        hidden_states,
-        w1,
-        w2,
-        routing_data,
-        gather_idx,
-        scatter_idx,
-        topk=topk,
-        activation=activation,
-        quant_config=quant_config,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        global_num_experts=global_num_experts,
-        expert_map=expert_map,
-    )
+        return triton_kernel_fused_experts(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            routing_data,
+            gather_idx,
+            scatter_idx,
+            topk=topk,
+            activation=activation,
+            quant_config=quant_config,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+        )
 
 
 # This is a triton implementation of the fused_experts function

@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from transformers import GptOssConfig
+from torch.profiler import record_function  # [新增] 导入 record_function
 
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention
@@ -187,7 +188,8 @@ class MLPBlock(torch.nn.Module):
                 self, x[:, : self.hidden_size], self.router.weight, self.router.bias
             )
         else:
-            g = self.router(x)
+            with record_function("gptossgating"):
+                g = self.router(x)
         x = self.experts(hidden_states=x, router_logits=g)
 
         if self.is_sequence_parallel:
