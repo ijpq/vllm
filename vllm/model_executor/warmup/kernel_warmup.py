@@ -24,6 +24,22 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# ========== [MEM_TRACK] 显存追踪代码 ==========
+def _mem_track(label: str):
+    """打印当前 GPU 显存使用情况"""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(
+            f"[MEM] {label:45s} | Alloc: {allocated:6.2f} GB | Reserved: {reserved:6.2f} GB | Peak: {peak:6.2f} GB"
+        )
+
+
+# ========== [MEM_TRACK] END ==========
+
+
 def kernel_warmup(worker: "Worker"):
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -31,10 +47,12 @@ def kernel_warmup(worker: "Worker"):
         and is_deep_gemm_supported()
         and envs.VLLM_DEEP_GEMM_WARMUP != "skip"
     )
+    _mem_track("deep gemm warmup: START")
     if do_deep_gemm_warmup:
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+    _mem_track("deep gemm warmup: END")
 
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if has_flashinfer() and current_platform.has_device_capability(90):
@@ -53,6 +71,7 @@ def kernel_warmup(worker: "Worker"):
     # deploying models such as E instances and encoder-only models.
     # As for those models, worker.model_runner.attn_groups is empty.
     # This change is made during EPD feature development.
+    _mem_track("flashinfer warmup: START")
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups
@@ -72,6 +91,7 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+    _mem_track("flashinfer warmup: END")
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:

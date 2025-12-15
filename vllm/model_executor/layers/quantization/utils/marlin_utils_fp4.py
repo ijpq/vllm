@@ -223,12 +223,20 @@ def prepare_fp4_layer_for_marlin(
 def prepare_moe_fp4_layer_for_marlin(
     layer: torch.nn.Module, input_dtype: torch.dtype | None = None
 ) -> None:
+    # breakpoint()
+    def _mem():
+        torch.cuda.synchronize()
+        m = torch.cuda.memory_allocated() / 1024**3
+        print(f"[MEM] {m:.3f} GB")
+        return m
+
     logger.warning_once(
         "Your GPU does not have native support for FP4 computation but "
         "FP4 quantization is being used. Weight-only FP4 compression will "
         "be used leveraging the Marlin kernel. This may degrade "
         "performance for compute-heavy workloads."
     )
+    _mem()
 
     is_nvfp4 = hasattr(layer, "w13_weight_scale_2")
     group_size = 16 if is_nvfp4 else 32
@@ -333,6 +341,7 @@ def prepare_moe_fp4_layer_for_marlin(
         bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
         bias = torch.nn.Parameter(bias, requires_grad=False)
         setattr(layer, name, bias)
+    _mem()
 
 
 def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):

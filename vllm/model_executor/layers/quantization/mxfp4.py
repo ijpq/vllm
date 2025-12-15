@@ -404,6 +404,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        # breakpoint()
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             prepare_moe_fp4_layer_for_marlin(layer, input_dtype=self.marlin_input_dtype)
         elif (
