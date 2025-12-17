@@ -31,6 +31,7 @@ if has_triton_kernels():
             ScatterIndx,
             routing_from_bitmatrix,
         )
+        from triton.topk import topk_forward
         from triton_kernels.tensor import Bitmatrix
     except (AttributeError, ImportError) as e:
         logger.error(
@@ -96,7 +97,15 @@ def _global_barrier_cas(
 def _cdiv(n, d):
     return (n + d - 1) // d
 
-
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+#         for num_warps in [1, 2, 4, 8, 16]
+#         for num_stages in [1, 2, 3]
+#     ],
+#     key=["N", "topk"],
+#     cache_results=True,
+# )
 @triton.jit
 def _fused_topk_softmax_routing_kernel(
     logits_ptr,
@@ -132,6 +141,7 @@ def _fused_topk_softmax_routing_kernel(
     ROWS_PER_PID: tl.constexpr,
     NUM_BLOCK_SIZES: tl.constexpr,  # number of block_m sizes (4 or 5)
     BLOCK_M_LOG2_START: tl.constexpr,  # log2 of smallest block_m (4 for 16)
+    num_stages: tl.constexpr
 ):
     """
     Fully fused kernel combining:
@@ -140,6 +150,7 @@ def _fused_topk_softmax_routing_kernel(
     - Phase 3: gather/scatter indices + block_pid_map
     """
     pid = tl.program_id(0)
+    num_program = tl.num_programs(0)
 
     offs_n = tl.arange(0, N)
     offs_k = tl.arange(0, topk)
@@ -148,20 +159,22 @@ def _fused_topk_softmax_routing_kernel(
 
     row_start = pid * ROWS_PER_PID
     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
+    rows = tl.arange(0, ROWS_PER_PID)
 
-    for row_idx in range(row_start, row_end):
-        logits_row_ptr = logits_ptr + row_idx * stride_logits_m
-        logits = tl.load(logits_row_ptr + offs_n * stride_logits_n)
+    # ld,st mask
+    for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program, num_stages):
+        logits_ptr = logits_ptr + (row_idx + rows)[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
+        logits = tl.load(logits_ptr)
 
         if not RENORM:
-            logits = tl.softmax(logits, dim=0)
+            logits = tl.softmax(logits, dim=1, keep_dims=True)
 
-        topk_vals = tl.full([topk], float("-inf"), dtype=tl.float32)
-        topk_idxs = tl.zeros([topk], dtype=tl.int32)
+        topk_vals = tl.full([ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32)
+        topk_idxs = tl.zeros([ROWS_PER_PID, topk], dtype=tl.int32)
 
         for k in tl.static_range(topk):
-            cur_max = tl.max(logits, axis=0)
-            cur_idx = tl.argmax(logits, axis=0)
+            cur_max = tl.max(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
+            cur_idx = tl.argmax(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
 
             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
@@ -170,12 +183,12 @@ def _fused_topk_softmax_routing_kernel(
             logits = tl.where(mask_selected, float("-inf"), logits)
 
         if RENORM:
-            topk_vals = tl.softmax(topk_vals, dim=0)
+            topk_vals = tl.softmax(topk_vals, dim=1, keep_dims=True)
 
-        weights_row_ptr = weights_ptr + row_idx * stride_weights_m
-        indices_row_ptr = indices_ptr + row_idx * stride_indices_m
-        tl.store(weights_row_ptr + offs_k * stride_weights_k, topk_vals)
-        tl.store(indices_row_ptr + offs_k * stride_indices_k, topk_idxs.to(tl.int16))
+        weights_ptr = weights_ptr + (row_idx+rows)[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
+        indices_ptr = indices_ptr + (row_idx+rows)[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
+        tl.store(weights_ptr, topk_vals)
+        tl.store(indices_ptr, topk_idxs.to(tl.int16))
 
         for k in tl.static_range(topk):
             expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
@@ -230,7 +243,7 @@ def _fused_topk_softmax_routing_kernel(
                 n_tiles = (h + block_m - 1) // block_m
                 tile_start = tl.load(offs_pad_ptr + expert_id * stride_token_offs_n)
 
-                for block_idx in range(n_tiles):
+                for block_idx in range( n_tiles):
                     # Pack (block_idx << 16) | expert_id
                     packed_val = (block_idx << 16) | expert_id
                     tl.store(
@@ -243,7 +256,7 @@ def _fused_topk_softmax_routing_kernel(
     expt_offs = tl.load(expt_offs_ptr + offs_n)
 
     prior_contrib = tl.zeros([N], dtype=tl.int32)
-    for p in range(pid):
+    for p in range( pid):
         prior_partial_ptr = partial_hist_ptr + p * stride_partial_m
         prior_hist = tl.load(prior_partial_ptr + offs_n * stride_partial_n)
         prior_contrib = prior_contrib + prior_hist
