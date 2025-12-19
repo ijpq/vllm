@@ -97,11 +97,76 @@ def _global_barrier_cas(
 def _cdiv(n, d):
     return (n + d - 1) // d
 
+# @triton.jit
+# def _topk_softmax(
+#     logits_ptr,
+#     stride_logits_m,
+#     stride_logits_n,
+#     weights_ptr,
+#     stride_weights_m,
+#     stride_weights_k,
+#     indices_ptr,
+#     stride_indices_m,
+#     stride_indices_k,
+#     M: tl.constexpr,
+#     N: tl.constexpr,
+#     topk: tl.constexpr,
+#     RENORM: tl.constexpr,
+#     hist_ptr,
+#     ROWS_PER_PID: tl.constexpr,
+#     num_program: tl.constexpr,
+#     pid,
+#     num_stages: tl.constexpr
+
+# ):
+
+#     offs_n = tl.arange(0, N)
+#     offs_k = tl.arange(0, topk)
+
+#     row_start = pid * ROWS_PER_PID
+#     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
+#     rows = tl.arange(0, ROWS_PER_PID)
+#     local_hist = tl.zeros([N], dtype=tl.int32)
+#     # ld,st mask
+#     for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program, num_stages):
+#         row_mask = (row_idx + rows) < M
+#         ptr = logits_ptr + (row_idx + rows)[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
+#         logits = tl.load(ptr,mask=row_mask[:,None], other=float("-inf"))
+
+#         if not RENORM:
+#             logits = tl.softmax(logits, dim=1, keep_dims=True)
+
+#         topk_vals = tl.full([ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32)
+#         topk_idxs = tl.zeros([ROWS_PER_PID, topk], dtype=tl.int32)
+
+#         for k in tl.static_range(topk):
+#             cur_max = tl.max(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
+#             cur_idx = tl.argmax(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
+
+#             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
+#             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
+
+#             mask_selected = offs_n == cur_idx
+#             logits = tl.where(mask_selected, float("-inf"), logits)
+
+#         if RENORM:
+#             topk_vals = tl.softmax(topk_vals, dim=1, keep_dims=True)
+
+#         w_ptr = weights_ptr + (row_idx+rows)[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
+#         i_ptr = indices_ptr + (row_idx+rows)[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
+#         tl.store(w_ptr, topk_vals, mask=row_mask[:,None])
+#         tl.store(i_ptr, topk_idxs.to(tl.int16), mask=row_mask[:,None])
+
+#         for k in tl.static_range(topk):
+#             expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
+#             tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
+#             local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
+    
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2, 4, 8, 16]
-#         for num_stages in [1, 2, 3]
+#         for num_warps in [1, 2]
+#         for num_stages in [1, 2]
 #     ],
 #     key=["N", "topk"],
 #     cache_results=True,
@@ -133,7 +198,7 @@ def _fused_topk_softmax_routing_kernel(
     stride_pid_map_n,
     max_n_tiles,
     barrier_ptr,  # [2] barrier counters
-    M,  # num_tokens (can be dynamic)
+    M: tl.constexpr,
     N: tl.constexpr,  # num_experts
     topk: tl.constexpr,
     num_programs: tl.constexpr,
@@ -155,16 +220,18 @@ def _fused_topk_softmax_routing_kernel(
     offs_n = tl.arange(0, N)
     offs_k = tl.arange(0, topk)
 
-    local_hist = tl.zeros([N], dtype=tl.int32)
+    local_hist = tl.zeros([ N], dtype=tl.int32)
 
     row_start = pid * ROWS_PER_PID
     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
     rows = tl.arange(0, ROWS_PER_PID)
 
     # ld,st mask
-    for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program, num_stages):
-        logits_ptr = logits_ptr + (row_idx + rows)[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
-        logits = tl.load(logits_ptr)
+    for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program):
+        row_mask = (row_idx + rows) < M
+        row_indices = row_idx + rows
+        ptr = logits_ptr +  row_indices[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
+        logits = tl.load(ptr,mask=row_mask[:,None], other=float("-inf"))
 
         if not RENORM:
             logits = tl.softmax(logits, dim=1, keep_dims=True)
@@ -179,21 +246,25 @@ def _fused_topk_softmax_routing_kernel(
             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
 
-            mask_selected = offs_n == cur_idx
+            mask_selected = offs_n[None,:] == cur_idx
             logits = tl.where(mask_selected, float("-inf"), logits)
 
         if RENORM:
             topk_vals = tl.softmax(topk_vals, dim=1, keep_dims=True)
 
-        weights_ptr = weights_ptr + (row_idx+rows)[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
-        indices_ptr = indices_ptr + (row_idx+rows)[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
-        tl.store(weights_ptr, topk_vals)
-        tl.store(indices_ptr, topk_idxs.to(tl.int16))
+        w_ptr = weights_ptr + row_indices[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
+        i_ptr = indices_ptr + row_indices[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
+        tl.store(w_ptr, topk_vals, mask=row_mask[:,None])
+        tl.store(i_ptr, topk_idxs, mask=row_mask[:,None])
 
-        for k in tl.static_range(topk):
-            expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
-            tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
-            local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
+
+        for row in tl.static_range(ROWS_PER_PID):
+            if row_idx + row < M:
+                for k in tl.static_range(topk):
+                    mask = (rows[:, None] == row) & (offs_k[None, :] == k)
+                    expert_id = tl.sum(tl.where(mask, topk_idxs, 0))
+                    tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
+                    local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
 
     partial_hist_row_ptr = partial_hist_ptr + pid * stride_partial_m
     tl.store(partial_hist_row_ptr + offs_n * stride_partial_n, local_hist)
@@ -343,6 +414,7 @@ def fused_routing(
     desired_programs = triton.cdiv(M, ROWS_PER_PID)
     num_programs = min(desired_programs, num_sms, max_num_programs)
     ROWS_PER_PID = triton.cdiv(M, num_programs)
+    # hist = torch.zeros((ROWS_PER_PID,N), device=device, dtype=torch.int32)
 
     partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
 
@@ -380,6 +452,7 @@ def fused_routing(
         ROWS_PER_PID=ROWS_PER_PID,
         NUM_BLOCK_SIZES=NUM_BLOCK_SIZES,
         BLOCK_M_LOG2_START=BLOCK_M_LOG2_START,
+        num_stages=1,
     )
 
     gate_scal = gate_scal.to(torch.bfloat16)
