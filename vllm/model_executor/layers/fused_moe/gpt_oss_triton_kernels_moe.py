@@ -17,6 +17,8 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_triton_kernels
+import os
+os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"
 
 logger = init_logger(__name__)
 
@@ -73,104 +75,209 @@ def pack_bitmatrix(
         bitmatrix_ptrs = bitmatrix + offsets_m[:, None] * bm_cols + offs[None, :]
         tl.store(bitmatrix_ptrs, y, mask=offsets_m[:, None] < n_rows)
 
+@triton.jit
+def _get_thread_id() -> tl.int32:
+    return tl.inline_asm_elementwise(
+        "mov.u32 $0, %tid.x;",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
 
 @triton.jit
-def _global_barrier_cas(
-    barrier_ptr,
-    num_programs: tl.constexpr,
-    phase: tl.constexpr,
-):
+def _atom_add_acq_rel(ptr, val) -> tl.int32:
+    """PTX atom.add with acq_rel semantics"""
+    return tl.inline_asm_elementwise(
+        "atom.add.acq_rel.gpu.u32 $0, [$1], $2;",
+        "=r, l, r",
+        [ptr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+@triton.jit
+def _atom_exch_release(ptr, val) -> tl.int32:
+    """PTX atom.exch with release semantics"""
+    return tl.inline_asm_elementwise(
+        "atom.exch.release.gpu.b32 $0, [$1], $2;",  # 修复: .u32 -> .b32
+        "=r, l, r",
+        [ptr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+@triton.jit
+def _ld_acquire(ptr) -> tl.int32:
+    """PTX ld.acquire"""
+    return tl.inline_asm_elementwise(
+        "ld.acquire.gpu.u32 $0, [$1];",
+        "=r, l",
+        [ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+@triton.jit
+def _bar_sync():
+    """PTX bar.sync - block level sync"""
+    tl.inline_asm_elementwise(
+        "bar.sync 0; mov.u32 $0, 0;",  # 简化版本
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+# @triton.jit
+# def _global_barrier_ptx(
+#     barrier_ptr,
+#     num_programs: tl.constexpr,
+#     phase: tl.constexpr,
+# ):
+#     counter_ptr = barrier_ptr + phase
+
+#     # each pid increments counter when it arrives
+#     arrived = tl.atomic_add(counter_ptr, 1, sem="acq_rel")
+
+#     if arrived == num_programs - 1:
+#         # last pid to arrive resets the counter
+#         tl.atomic_xchg(counter_ptr, 0, sem="release")
+#     else:
+#         while tl.atomic_cas(counter_ptr, 0, 0) != 0:
+#             pass
+# @triton.jit  
+# def _global_barrier_ptx(
+#     barrier_ptr,
+#     num_programs: tl.constexpr,
+#     phase: tl.constexpr,
+# ):
+#     """
+#     Global barrier using pure PTX.
+#     """
+#     counter_ptr = barrier_ptr + phase
+#     tid = _get_thread_id()
+    
+#     if tid == 0:
+#         arrived = _atom_add_acq_rel(counter_ptr, 1)
+        
+#         if arrived == num_programs - 1:
+#             _atom_exch_release(counter_ptr, 0)
+#         else:
+#             while _ld_acquire(counter_ptr) != 0:
+#                 pass
+    
+#     _bar_sync()
+# @triton.jit
+# def _global_barrier_ptx(
+#     barrier_ptr,
+#     num_programs: tl.constexpr,
+#     phase: tl.constexpr,
+# ):
+#     counter_ptr = barrier_ptr + phase
+#     tid = _get_thread_id()
+    
+#     # 1. 只有 Leader (tid=0) 负责打卡
+#     # 这里的 mask 保证只有物理线程0执行 atomic_add
+#     # 其他线程得到的 arrived 默认为 0 (但这不重要，因为我们只看 Leader)
+#     is_leader = tid == 0
+#     arrived = tl.atomic_add(counter_ptr, 1, mask=is_leader, sem="acq_rel")
+
+#     # 2. 只有 Leader 判断是否需要重置
+#     # 我们不能用 python if，必须用逻辑运算 + mask
+#     # 逻辑：是Leader 且 是最后一个到达的
+#     do_reset = is_leader & (arrived == num_programs - 1)
+#     tl.atomic_xchg(counter_ptr, 0, mask=do_reset, sem="release")
+
+#     # 3. 只有 Leader 负责自旋等待 (Spin Wait)
+#     # 这里的关键是：循环条件必须包含 is_leader
+#     # 对于非 Leader 线程（tid != 0），条件直接为 False，它们根本不会进入循环！
+#     # 对于 Leader，它会卡在这里直到 global 计数器归零
+#     while  (tl.atomic_add(counter_ptr, 0, mask=is_leader, sem="acquire") != 0):
+#         pass
+
+#     # 4. 块内同步
+#     # 此时：
+#     # - Leader 线程：确认 global lock 解除后，运行到这里。
+#     # - 其他线程：因为没进 while 循环，早就运行到这里并阻塞等待了。
+#     # 当 Leader 到达这里时，所有线程“集结完毕”，一起释放。
+
+@triton.jit
+def _global_barrier_no_branch(barrier_ptr, num_programs: tl.constexpr, phase: tl.constexpr):
+    """
+    Barrier without branch instructions - pure predicated execution.
+    """
     counter_ptr = barrier_ptr + phase
-
-    # each pid increments counter when it arrives
-    arrived = tl.atomic_add(counter_ptr, 1, sem="acq_rel")
-
-    if arrived == num_programs - 1:
-        # last pid to arrive resets the counter
-        tl.atomic_xchg(counter_ptr, 0, sem="release")
-    else:
-        while tl.atomic_cas(counter_ptr, 0, 0) != 0:
-            pass
-
-
+    
+    # 所有线程执行相同指令，用 predicate mask
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %is_tid0;
+            .reg .pred %is_last;
+            .reg .pred %not_done;
+            .reg .u32 %tid;
+            .reg .u32 %arrived;
+            .reg .u32 %val;
+            .reg .u32 %last_idx;
+            .reg .u32 %dummy;
+            
+            mov.u32 %tid, %tid.x;
+            mov.u32 %last_idx, $2;
+            sub.u32 %last_idx, %last_idx, 1;
+            
+            setp.eq.u32 %is_tid0, %tid, 0;
+            
+            // Only tid0 does atomic add, others get 0
+            mov.u32 %arrived, 0;
+            @%is_tid0 atom.add.acq_rel.gpu.u32 %arrived, [$1], 1;
+            
+            // Check if last
+            setp.eq.u32 %is_last, %arrived, %last_idx;
+            
+            // Only last tid0 resets counter
+            mov.u32 %dummy, 0;
+            @%is_last atom.exch.release.gpu.b32 %dummy, [$1], 0;
+            
+            // Spin loop - only non-last tid0 spins, others skip immediately
+            // Use setp to create combined predicate
+            setp.lt.u32 %not_done, %arrived, %last_idx;  // arrived < last_idx
+            and.pred %not_done, %not_done, %is_tid0;     // AND is_tid0
+            
+        SPIN_LOOP:
+            @!%not_done bra EXIT_SPIN;
+            ld.acquire.gpu.u32 %val, [$1];
+            setp.ne.u32 %not_done, %val, 0;
+            and.pred %not_done, %not_done, %is_tid0;
+            @%not_done bra SPIN_LOOP;
+            
+        EXIT_SPIN:
+            bar.sync 0;
+            mov.u32 $0, 0;
+        }
+        """,
+        "=r, l, r",
+        [counter_ptr, num_programs],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 @triton.jit
 def _cdiv(n, d):
     return (n + d - 1) // d
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1,2]
+    ],
+    key=["N", "topk"],
+    reset_to_zero=['barrier_ptr']
 
-# @triton.jit
-# def _topk_softmax(
-#     logits_ptr,
-#     stride_logits_m,
-#     stride_logits_n,
-#     weights_ptr,
-#     stride_weights_m,
-#     stride_weights_k,
-#     indices_ptr,
-#     stride_indices_m,
-#     stride_indices_k,
-#     M: tl.constexpr,
-#     N: tl.constexpr,
-#     topk: tl.constexpr,
-#     RENORM: tl.constexpr,
-#     hist_ptr,
-#     ROWS_PER_PID: tl.constexpr,
-#     num_program: tl.constexpr,
-#     pid,
-#     num_stages: tl.constexpr
-
-# ):
-
-#     offs_n = tl.arange(0, N)
-#     offs_k = tl.arange(0, topk)
-
-#     row_start = pid * ROWS_PER_PID
-#     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
-#     rows = tl.arange(0, ROWS_PER_PID)
-#     local_hist = tl.zeros([N], dtype=tl.int32)
-#     # ld,st mask
-#     for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program, num_stages):
-#         row_mask = (row_idx + rows) < M
-#         ptr = logits_ptr + (row_idx + rows)[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
-#         logits = tl.load(ptr,mask=row_mask[:,None], other=float("-inf"))
-
-#         if not RENORM:
-#             logits = tl.softmax(logits, dim=1, keep_dims=True)
-
-#         topk_vals = tl.full([ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32)
-#         topk_idxs = tl.zeros([ROWS_PER_PID, topk], dtype=tl.int32)
-
-#         for k in tl.static_range(topk):
-#             cur_max = tl.max(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
-#             cur_idx = tl.argmax(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
-
-#             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
-#             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
-
-#             mask_selected = offs_n == cur_idx
-#             logits = tl.where(mask_selected, float("-inf"), logits)
-
-#         if RENORM:
-#             topk_vals = tl.softmax(topk_vals, dim=1, keep_dims=True)
-
-#         w_ptr = weights_ptr + (row_idx+rows)[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
-#         i_ptr = indices_ptr + (row_idx+rows)[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
-#         tl.store(w_ptr, topk_vals, mask=row_mask[:,None])
-#         tl.store(i_ptr, topk_idxs.to(tl.int16), mask=row_mask[:,None])
-
-#         for k in tl.static_range(topk):
-#             expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
-#             tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
-#             local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
-    
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2]
-#         for num_stages in [1, 2]
-#     ],
-#     key=["N", "topk"],
-#     cache_results=True,
-# )
+)
 @triton.jit
 def _fused_topk_softmax_routing_kernel(
     logits_ptr,
@@ -201,12 +308,11 @@ def _fused_topk_softmax_routing_kernel(
     M: tl.constexpr,
     N: tl.constexpr,  # num_experts
     topk: tl.constexpr,
-    num_programs: tl.constexpr,
     RENORM: tl.constexpr,
     ROWS_PER_PID: tl.constexpr,
     NUM_BLOCK_SIZES: tl.constexpr,  # number of block_m sizes (4 or 5)
     BLOCK_M_LOG2_START: tl.constexpr,  # log2 of smallest block_m (4 for 16)
-    num_stages: tl.constexpr
+    flag_ptr
 ):
     """
     Fully fused kernel combining:
@@ -215,7 +321,7 @@ def _fused_topk_softmax_routing_kernel(
     - Phase 3: gather/scatter indices + block_pid_map
     """
     pid = tl.program_id(0)
-    num_program = tl.num_programs(0)
+    num_programs = tl.num_programs(0)
 
     offs_n = tl.arange(0, N)
     offs_k = tl.arange(0, topk)
@@ -227,7 +333,7 @@ def _fused_topk_softmax_routing_kernel(
     rows = tl.arange(0, ROWS_PER_PID)
 
     # ld,st mask
-    for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program):
+    for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_programs):
         row_mask = (row_idx + rows) < M
         row_indices = row_idx + rows
         ptr = logits_ptr +  row_indices[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
@@ -269,7 +375,7 @@ def _fused_topk_softmax_routing_kernel(
     partial_hist_row_ptr = partial_hist_ptr + pid * stride_partial_m
     tl.store(partial_hist_row_ptr + offs_n * stride_partial_n, local_hist)
 
-    _global_barrier_cas(barrier_ptr, num_programs, phase=0)
+    _global_barrier_no_branch(barrier_ptr, num_programs, 0)
 
     if pid == 0:
         hist = tl.load(hist_ptr + offs_n)
@@ -322,7 +428,7 @@ def _fused_topk_softmax_routing_kernel(
                         packed_val,
                     )
 
-    _global_barrier_cas(barrier_ptr, num_programs, phase=1)
+    _global_barrier_no_branch(barrier_ptr, num_programs, 1)
 
     expt_offs = tl.load(expt_offs_ptr + offs_n)
 
@@ -335,6 +441,8 @@ def _fused_topk_softmax_routing_kernel(
     local_offset = tl.zeros([N], dtype=tl.int32)
 
     for row_idx in range(row_start, row_end):
+        # row_indices = row_idx + rows
+        # row_mask = row_indices  < M
         weights_row_ptr = weights_ptr + row_idx * stride_weights_m
         indices_row_ptr = indices_ptr + row_idx * stride_indices_m
         weights = tl.load(weights_row_ptr + offs_k * stride_weights_k)
@@ -417,6 +525,7 @@ def fused_routing(
     # hist = torch.zeros((ROWS_PER_PID,N), device=device, dtype=torch.int32)
 
     partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
+    flag = torch.zeros(num_programs * 3, device="cuda", dtype=torch.int32)
 
     _fused_topk_softmax_routing_kernel[(num_programs,)](
         logits_ptr=router_logits,
@@ -447,12 +556,11 @@ def fused_routing(
         M=M,
         N=N,
         topk=topk,
-        num_programs=num_programs,
         RENORM=renormalize,
         ROWS_PER_PID=ROWS_PER_PID,
         NUM_BLOCK_SIZES=NUM_BLOCK_SIZES,
         BLOCK_M_LOG2_START=BLOCK_M_LOG2_START,
-        num_stages=1,
+        flag_ptr=flag
     )
 
     gate_scal = gate_scal.to(torch.bfloat16)
