@@ -96,282 +96,750 @@ def _global_barrier_cas(
 def _cdiv(n, d):
     return (n + d - 1) // d
 
+# @triton.jit
+# def _prefix_sum_index(
+#     hist_ptr,
+#     M,
+#     N,
+#     expt_offs_ptr,
+#     NUM_BLOCK_SIZES,
+#     BLOCK_M_LOG2_START,
+#     token_offs_pad_ptr,
+#     stride_tom,
+#     stride_ton,
+#     block_pid_map_ptr,
+#     stride_pmm,
+#     stride_pmn,
+#     max_n_tiles,
+# ):
 
+#     pid = tl.program_id(0)
+#     offs_n = tl.arange(0, N)
+#     if pid == 0:
+#         hist = tl.load(hist_ptr + offs_n)
+
+#         cumsum = 0
+#         for i in tl.static_range(N):
+#             h = tl.sum(tl.where(offs_n == i, hist, 0))
+#             tl.store(expt_offs_ptr + i, cumsum)
+#             cumsum = cumsum + h
+#         tl.store(expt_offs_ptr + N, cumsum)
+
+#         for size_idx in tl.static_range(NUM_BLOCK_SIZES):
+#             block_m_log2 = (
+#                 BLOCK_M_LOG2_START + size_idx
+#             )  # 4, 5, 6, 7 (for 16, 32, 64, 128)
+#             block_m = 1 << block_m_log2
+
+#             cumsum_pad = 0
+#             for i in tl.static_range(N):
+#                 h = tl.sum(tl.where(offs_n == i, hist, 0))
+#                 n_tiles = (h + block_m - 1) // block_m  # cdiv
+#                 offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_tom, 
+#                 tl.store(offs_pad_ptr + i * stride_ton, cumsum_pad)
+#                 cumsum_pad = cumsum_pad + n_tiles
+#             offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_tom,
+#             tl.store(offs_pad_ptr + N * stride_ton, cumsum_pad)
+
+#         for size_idx in tl.static_range(NUM_BLOCK_SIZES):
+#             pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pmm, 
+#             for tile_idx in range(max_n_tiles):
+#                 tl.store(pid_map_row_ptr + tile_idx * stride_pmn, -1)
+
+#         for size_idx in tl.static_range(NUM_BLOCK_SIZES):
+#             block_m_log2 = BLOCK_M_LOG2_START + size_idx
+#             block_m = 1 << block_m_log2
+
+#             offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_tom
+#             pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pmm
+
+#             for expert_id in range(N):
+#                 h = tl.load(hist_ptr + expert_id)
+#                 n_tiles = (h + block_m - 1) // block_m
+#                 tile_start = tl.load(offs_pad_ptr + expert_id * stride_ton)
+
+#                 for block_idx in range(n_tiles):
+#                     # Pack (block_idx << 16) | expert_id
+#                     packed_val = (block_idx << 16) | expert_id
+#                     tl.store(
+#                         pid_map_row_ptr + (tile_start + block_idx) * stride_pmn,
+#                         packed_val,
+#                     )
+
+# @triton.jit
+# def _generate_index(
+#     M,
+#     N,
+#     expt_offs_ptr,
+#     partial_hist_ptr,
+#     stride_pm,
+#     stride_pn,
+#     weights_ptr,
+#     indices_ptr,
+#     stride_wm,
+#     stride_wk,
+#     stride_im,
+#     stride_ik,
+#     gate_scal_ptr,
+#     topk_index_ptr,
+#     gate_index_ptr,
+#     topk
+# ):
+
+#     pid = tl.program_id(0)
+#     offs_n = tl.arange(0, N)
+#     offs_k = tl.arange(0, topk)
+#     expt_offs = tl.load(expt_offs_ptr + offs_n)
+
+#     prior_contrib = tl.zeros([N], dtype=tl.int32)
+#     for p in range(pid):
+#         prior_partial_ptr = partial_hist_ptr + p * stride_pm
+#         prior_hist = tl.load(prior_partial_ptr + offs_n * stride_pn)
+#         prior_contrib = prior_contrib + prior_hist
+
+#     local_offset = tl.zeros([N], dtype=tl.int32)
+
+#     for row_idx in range(row_start, row_end):
+#         weights_row_ptr = weights_ptr + row_idx * stride_wm 
+#         indices_row_ptr = indices_ptr + row_idx * stride_im 
+#         weights = tl.load(weights_row_ptr + offs_k * stride_wk)
+#         expert_ids = tl.load(indices_row_ptr + offs_k * stride_ik).to(tl.int32)
+
+#         for k in tl.static_range(topk):
+#             expert_id = tl.sum(tl.where(offs_k == k, expert_ids, 0))
+#             weight_val = tl.sum(tl.where(offs_k == k, weights, 0.0))
+#             flat_idx = row_idx * topk + k
+
+#             expert_base = tl.sum(tl.where(offs_n == expert_id, expt_offs, 0))
+#             expert_prior = tl.sum(tl.where(offs_n == expert_id, prior_contrib, 0))
+#             expert_local = tl.sum(tl.where(offs_n == expert_id, local_offset, 0))
+
+#             global_pos = expert_base + expert_prior + expert_local
+
+#             tl.store(gate_scal_ptr + global_pos, weight_val)
+#             tl.store(topk_index_ptr + global_pos, flat_idx)
+#             tl.store(gate_index_ptr + flat_idx, global_pos)
+
+#             local_offset = tl.where(offs_n == expert_id, local_offset + 1, local_offset)
+
+
+# @triton.autotune(
+#     configs=[
+#         triton.Config({"ROWS_PER_PID": r}, num_warps=num_warps, num_stages=num_stages)
+#         for r in [1, 2, 4, 8, 16, 32]
+#         for num_warps in [1, 2, 4, 8, 16]
+#         for num_stages in [1, 2, 3]
+#     ],
+#     key=["N", "topk"],
+#     cache_results=True,
+# )
+# @triton.jit
+# def _topk_softmax_kernel(
+#     logits_ptr,
+#     weights_ptr,
+#     indices_ptr,
+#     M: tl.constexpr,
+#     N: tl.constexpr,
+#     topk: tl.constexpr,
+#     stride_lm,
+#     stride_ln,
+#     stride_wm,
+#     stride_wk,
+#     stride_im,
+#     stride_ik,
+#     hist_ptr, # MN
+#     local_hist, #ROWSPERPID,N
+#     partial_hist_ptr,
+#     stride_pm,
+#     stride_pn,
+#     RENORM: tl.constexpr,
+#     ROWS_PER_PID: tl.constexpr,
+#     num_stages: tl.constexpr,
+# ):
+#     pid = tl.program_id(0)
+#     num_programs = tl.num_programs(0)
+
+#     offs_n = tl.arange(0, N)
+#     offs_k = tl.arange(0, topk)
+
+#     # impl topk<=2 and RENORM specialization by tl.constexpr,
+#     # same as constexpr if in C++17
+#     rows = tl.arange(0, ROWS_PER_PID)
+#     for row_idx in tl.range(
+#         pid,
+#         M,
+#         num_programs,
+#         num_stages,
+#         warp_specialize=True,
+#     ):
+#         topk_vals = tl.full([topk], float("-inf"), dtype=tl.float32)
+#         topk_idxs = tl.zeros([topk], dtype=tl.int32)
+
+#         ptr_off = (
+#             logits_ptr + row_idx * stride_lm + offs_n * stride_ln
+#         )
+#         logits = tl.load(ptr_off, other=float("-inf"))
+
+#         if not RENORM:
+#             logits = tl.softmax(logits)
+
+#         for k in tl.static_range(topk):
+#             cur_max = tl.max(logits)
+#             cur_idx = tl.argmax(logits)
+
+#             k_mask = offs_k == k
+#             topk_vals = tl.where(
+#                 k_mask, cur_max, topk_vals
+#             ) 
+#             topk_idxs = tl.where(k_mask, cur_idx, topk_idxs)
+
+#             mask_selected = cur_idx == offs_n
+#             logits = tl.where(mask_selected, float("-inf"), logits)
+
+#         if RENORM:
+#             topk_vals = tl.softmax(topk_vals)
+
+#         # WB
+#         tl.store(
+#             weights_ptr
+#             + row_idx * stride_wm  # [ROWSPERPID,1]
+#             + offs_k * stride_wk,  # [1, topkpadded]
+#             topk_vals,
+#         )
+#         tl.store(
+#             indices_ptr
+#             + row_idx * stride_im
+#             + offs_k * stride_ik,
+#             topk_idxs.to(tl.int16),
+#         )
+#         for k in tl.static_range(topk):
+#             expert_id = tl.where(offs_k == k, topk_idxs, 0) #[1,]
+#             tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
+#             local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist) 
+
+# @triton.jit
+# def _fused_topk_softmax(
+#     logits_ptr,
+#     stride_logits_m,
+#     stride_logits_n,
+#     weights_ptr,
+#     stride_weights_m,
+#     stride_weights_k,
+#     indices_ptr,
+#     stride_indices_m,
+#     stride_indices_k,
+#     hist_ptr,  # [N] global histogram
+#     expt_offs_ptr,  # [N] prefix sum of histogram (token_offs_raw)
+#     partial_hist_ptr,  # [num_programs, N] per-program histogram
+#     stride_partial_m,
+#     stride_partial_n,
+#     gate_scal_ptr,  # [M * topk] reordered weights
+#     topk_index_ptr,  # [M * topk] gather indices
+#     gate_index_ptr,  # [M * topk] scatter indices
+#     token_offs_pad_ptr,  # [NUM_BLOCK_SIZES, N+1] padded offsets for each block_m
+#     stride_token_offs_m,
+#     stride_token_offs_n,
+#     block_pid_map_ptr,  # [NUM_BLOCK_SIZES, max_n_tiles] pid mapping
+#     stride_pid_map_m,
+#     stride_pid_map_n,
+#     max_n_tiles,
+#     barrier_ptr,  # [2] barrier counters
+#     M,  # num_tokens (can be dynamic)
+#     N: tl.constexpr,  # num_experts
+#     topk: tl.constexpr,
+#     num_programs: tl.constexpr,
+#     RENORM: tl.constexpr,
+#     ROWS_PER_PID: tl.constexpr,
+#     NUM_BLOCK_SIZES: tl.constexpr,  # number of block_m sizes (4 or 5)
+#     BLOCK_M_LOG2_START: tl.constexpr,  # log2 of smallest block_m (4 for 16)
+# ):
+#     """
+#     Fully fused kernel combining:
+#     - Phase 1: topk + softmax + hist accumulation
+#     - Phase 2: prefixsum + ExptData init (single program)
+#     - Phase 3: gather/scatter indices + block_pid_map
+#     """
+#     pid = tl.program_id(0)
+
+#     offs_n = tl.arange(0, N)
+#     offs_k = tl.arange(0, topk)
+
+#     local_hist = tl.zeros([N], dtype=tl.int32)
+
+#     row_start = pid * ROWS_PER_PID
+#     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
+
+#     for row_idx in range(row_start, row_end):
+#         logits_row_ptr = logits_ptr + row_idx * stride_logits_m
+#         logits = tl.load(logits_row_ptr + offs_n * stride_logits_n)
+
+#         if not RENORM:
+#             logits = tl.softmax(logits, dim=0)
+
+#         topk_vals = tl.full([topk], float("-inf"), dtype=tl.float32)
+#         topk_idxs = tl.zeros([topk], dtype=tl.int32)
+
+#         for k in tl.static_range(topk):
+#             cur_max = tl.max(logits, axis=0)
+#             cur_idx = tl.argmax(logits, axis=0)
+
+#             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
+#             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
+
+#             mask_selected = offs_n == cur_idx
+#             logits = tl.where(mask_selected, float("-inf"), logits)
+
+#         if RENORM:
+#             topk_vals = tl.softmax(topk_vals, dim=0)
+
+#         weights_row_ptr = weights_ptr + row_idx * stride_weights_m
+#         indices_row_ptr = indices_ptr + row_idx * stride_indices_m
+#         tl.store(weights_row_ptr + offs_k * stride_weights_k, topk_vals)
+#         tl.store(indices_row_ptr + offs_k * stride_indices_k, topk_idxs.to(tl.int16))
+
+#         for k in tl.static_range(topk):
+#             expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
+#             tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
+#             local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
+
+#     partial_hist_row_ptr = partial_hist_ptr + pid * stride_partial_m
+#     tl.store(partial_hist_row_ptr + offs_n * stride_partial_n, local_hist)
+
+# def fused_routing(
+#     router_logits: torch.Tensor,
+#     topk: int,
+#     renormalize: bool = True,
+# ) -> tuple["RoutingData", "GatherIndx", "ScatterIndx"]:
+#     """
+#     Fully fused topk, softmax, routing, and ExptData computation.
+#     """
+#     M, N = router_logits.shape
+#     device = router_logits.device
+#     dtype = router_logits.dtype
+
+#     # Validate constraints
+#     BLOCK_N = triton.next_power_of_2(N)
+#     topk_padded = triton.next_power_of_2(topk)
+#     assert (BLOCK_N == N) and (topk_padded == topk), (
+#         f"N and topk must be power of 2, got N={N}, topk={topk}"
+#     )
+
+#     weights = torch.empty((M, topk), device=device, dtype=dtype)
+#     indices = torch.empty((M, topk), device=device, dtype=torch.int16)
+#     hist = torch.zeros((N), device=device, dtype=torch.int32) 
+#     expt_offs = torch.empty(N + 1, device=device, dtype=torch.int32)
+
+#     n_gates = M * topk
+#     gate_scal = torch.empty(n_gates, device=device, dtype=dtype)
+#     topk_index = torch.empty(n_gates, device=device, dtype=torch.int32)
+#     gate_index = torch.empty(n_gates, device=device, dtype=torch.int32)
+
+#     # block_m sizes: 16, 32, 64, 128 (NUM_BLOCK_SIZES=4)
+#     BLOCK_M_LOG2_START = 4
+#     NUM_BLOCK_SIZES = 4
+
+#     if n_gates <= N:
+#         max_n_tiles = n_gates
+#     else:
+#         min_block_m = 1 << BLOCK_M_LOG2_START  # 16
+#         max_n_tiles = N - 1 - ((N - n_gates - 1) // min_block_m)
+
+#     token_offs_pad = torch.empty(
+#         (NUM_BLOCK_SIZES, N + 1), device=device, dtype=torch.int32
+#     )
+#     block_pid_map = torch.full(
+#         (NUM_BLOCK_SIZES, max_n_tiles), -1, device=device, dtype=torch.int32
+#     )
+
+
+#     # device_props = torch.cuda.get_device_properties(device)
+#     # num_sms = device_props.multi_processor_count
+
+#     # max_num_programs = 64
+#     # ROWS_PER_PID = triton.cdiv(M, num_programs)
+
+#     partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
+
+#     grid = lambda META: (triton.cdiv(M, META["ROWS_PER_PID"]),)
+#     _topk_softmax_kernel[(grid,)](
+#         logits_ptr=router_logits,
+#         weights_ptr=weights,
+#         indices_ptr=indices,
+#         M=M,
+#         N=N,
+#         topk=topk,
+#         stride_lm=router_logits.stride(0),
+#         stride_ln=router_logits.stride(1),
+#         stride_wm=weights.stride(0),
+#         stride_wk=weights.stride(1),
+#         stride_im=indices.stride(0),
+#         stride_ik=indices.stride(1),
+#         hist_ptr=hist,
+#     )
+
+#     # _fused_topk_softmax_routing_kernel[(num_programs,)](
+#     #     logits_ptr=router_logits,
+#     #     stride_logits_m=router_logits.stride(0),
+#     #     stride_logits_n=router_logits.stride(1),
+#     #     weights_ptr=weights,
+#     #     stride_weights_m=weights.stride(0),
+#     #     stride_weights_k=weights.stride(1),
+#     #     indices_ptr=indices,
+#     #     stride_indices_m=indices.stride(0),
+#     #     stride_indices_k=indices.stride(1),
+#     #     hist_ptr=hist,
+#     #     expt_offs_ptr=expt_offs,
+#     #     partial_hist_ptr=partial_hist,
+#     #     stride_partial_m=partial_hist.stride(0),
+#     #     stride_partial_n=partial_hist.stride(1),
+#     #     gate_scal_ptr=gate_scal,
+#     #     topk_index_ptr=topk_index,
+#     #     gate_index_ptr=gate_index,
+#     #     token_offs_pad_ptr=token_offs_pad,
+#     #     stride_token_offs_m=token_offs_pad.stride(0),
+#     #     stride_token_offs_n=token_offs_pad.stride(1),
+#     #     block_pid_map_ptr=block_pid_map,
+#     #     stride_pid_map_m=block_pid_map.stride(0),
+#     #     stride_pid_map_n=block_pid_map.stride(1),
+#     #     max_n_tiles=max_n_tiles,
+#     #     barrier_ptr=barrier,
+#     #     M=M,
+#     #     N=N,
+#     #     topk=topk,
+#     #     num_programs=num_programs,
+#     #     RENORM=renormalize,
+#     #     ROWS_PER_PID=ROWS_PER_PID,
+#     #     NUM_BLOCK_SIZES=NUM_BLOCK_SIZES,
+#     #     BLOCK_M_LOG2_START=BLOCK_M_LOG2_START,
+#     # )
+
+#     gate_scal = gate_scal.to(torch.bfloat16)
+#     weights = weights.to(torch.bfloat16)
+
+#     token_offs_pad_dict = {
+#         (1 << (BLOCK_M_LOG2_START + i)): token_offs_pad[i]
+#         for i in range(NUM_BLOCK_SIZES)
+#     }
+#     block_pid_map_dict = {
+#         (1 << (BLOCK_M_LOG2_START + i)): block_pid_map[i]
+#         for i in range(NUM_BLOCK_SIZES)
+#     }
+
+#     # token_offs_raw is expt_offs[:N]
+#     token_offs_raw = expt_offs[: N + 1]
+
+#     expt_data = ExptData(
+#         hist=hist,
+#         token_offs_raw=token_offs_raw,
+#         token_offs_pad=token_offs_pad_dict,
+#         block_pid_map=block_pid_map_dict,
+#     )
+
+#     gather_index = GatherIndx(topk_index, gate_index)
+#     scatter_index = ScatterIndx(gate_index, topk_index)
+#     routing_data = RoutingData(
+#         gate_scal=gate_scal,
+#         expt_hist=hist,
+#         n_expts_tot=N,
+#         n_expts_act=topk,
+#         expt_data=expt_data,
+#     )
+#     return routing_data, gather_index, scatter_index
+# ============ 共享的Autotune配置 ============
+ROUTING_CONFIGS = [
+    triton.Config({'ROWS_PER_PID': r}, num_warps=warp) for r in [1,2,4,8,16,32] for warp in [1,2,4,8]
+]
+
+# ============ Kernel 1: TopK + Histogram ============
+@triton.autotune(
+    configs=ROUTING_CONFIGS,
+    key=['M', 'N', 'K'],
+)
 @triton.jit
-def _fused_topk_softmax_routing_kernel(
-    logits_ptr,
-    stride_logits_m,
-    stride_logits_n,
-    weights_ptr,
-    stride_weights_m,
-    stride_weights_k,
-    indices_ptr,
-    stride_indices_m,
-    stride_indices_k,
-    hist_ptr,  # [N] global histogram
-    expt_offs_ptr,  # [N] prefix sum of histogram (token_offs_raw)
-    partial_hist_ptr,  # [num_programs, N] per-program histogram
-    stride_partial_m,
-    stride_partial_n,
-    gate_scal_ptr,  # [M * topk] reordered weights
-    topk_index_ptr,  # [M * topk] gather indices
-    gate_index_ptr,  # [M * topk] scatter indices
-    token_offs_pad_ptr,  # [NUM_BLOCK_SIZES, N+1] padded offsets for each block_m
-    stride_token_offs_m,
-    stride_token_offs_n,
-    block_pid_map_ptr,  # [NUM_BLOCK_SIZES, max_n_tiles] pid mapping
-    stride_pid_map_m,
-    stride_pid_map_n,
-    max_n_tiles,
-    barrier_ptr,  # [2] barrier counters
-    M,  # num_tokens (can be dynamic)
-    N: tl.constexpr,  # num_experts
-    topk: tl.constexpr,
-    num_programs: tl.constexpr,
+def phase1_topk_and_hist(
+    logits_ptr, weights_ptr, indices_ptr,
+    hist_ptr, partial_hist_ptr,
+    M, N, K, topk,
+    stride_logits_m, stride_logits_k,
+    stride_weights_m, stride_weights_k,
+    stride_indices_m, stride_indices_k,
+    stride_partial_m, stride_partial_n,
     RENORM: tl.constexpr,
     ROWS_PER_PID: tl.constexpr,
-    NUM_BLOCK_SIZES: tl.constexpr,  # number of block_m sizes (4 or 5)
-    BLOCK_M_LOG2_START: tl.constexpr,  # log2 of smallest block_m (4 for 16)
 ):
-    """
-    Fully fused kernel combining:
-    - Phase 1: topk + softmax + hist accumulation
-    - Phase 2: prefixsum + ExptData init (single program)
-    - Phase 3: gather/scatter indices + block_pid_map
-    """
     pid = tl.program_id(0)
-
     offs_n = tl.arange(0, N)
     offs_k = tl.arange(0, topk)
-
+    
     local_hist = tl.zeros([N], dtype=tl.int32)
-
+    
     row_start = pid * ROWS_PER_PID
     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
-
+    
     for row_idx in range(row_start, row_end):
+        # 1. Load logits
         logits_row_ptr = logits_ptr + row_idx * stride_logits_m
-        logits = tl.load(logits_row_ptr + offs_n * stride_logits_n)
-
+        logits = tl.load(logits_row_ptr + offs_n * stride_logits_k)
+        
+        # 2. Compute topk
         if not RENORM:
             logits = tl.softmax(logits, dim=0)
-
+        
         topk_vals = tl.full([topk], float("-inf"), dtype=tl.float32)
         topk_idxs = tl.zeros([topk], dtype=tl.int32)
-
+        
         for k in tl.static_range(topk):
             cur_max = tl.max(logits, axis=0)
             cur_idx = tl.argmax(logits, axis=0)
-
+            
             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
-
+            
             mask_selected = offs_n == cur_idx
             logits = tl.where(mask_selected, float("-inf"), logits)
-
+        
         if RENORM:
             topk_vals = tl.softmax(topk_vals, dim=0)
-
+        
+        # 3. Store weights and indices
         weights_row_ptr = weights_ptr + row_idx * stride_weights_m
         indices_row_ptr = indices_ptr + row_idx * stride_indices_m
         tl.store(weights_row_ptr + offs_k * stride_weights_k, topk_vals)
         tl.store(indices_row_ptr + offs_k * stride_indices_k, topk_idxs.to(tl.int16))
-
+        
+        # 4. Update histograms
         for k in tl.static_range(topk):
             expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
             tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
             local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
-
+    
+    # 5. Store partial histogram
     partial_hist_row_ptr = partial_hist_ptr + pid * stride_partial_m
     tl.store(partial_hist_row_ptr + offs_n * stride_partial_n, local_hist)
 
-    _global_barrier_cas(barrier_ptr, num_programs, phase=0)
 
-    if pid == 0:
-        hist = tl.load(hist_ptr + offs_n)
-
-        cumsum = 0
+# ============ Kernel 2: Prefix Sum (不需要autotune) ============
+@triton.jit
+def phase2_prefix_sum(
+    hist_ptr, expt_offs_ptr,
+    token_offs_pad_ptr, block_pid_map_ptr,
+    max_n_tiles,
+    stride_token_offs_m, stride_token_offs_n,
+    stride_pid_map_m, stride_pid_map_n,
+    N: tl.constexpr,
+    NUM_BLOCK_SIZES: tl.constexpr,
+    BLOCK_M_LOG2_START: tl.constexpr,
+):
+    """单program执行，不需要autotune"""
+    pid = tl.program_id(0)
+    if pid != 0:
+        return
+    
+    offs_n = tl.arange(0, N)
+    hist = tl.load(hist_ptr + offs_n)
+    
+    # 1. Compute expt_offs (prefix sum)
+    cumsum = 0
+    for i in tl.static_range(N):
+        h = tl.sum(tl.where(offs_n == i, hist, 0))
+        tl.store(expt_offs_ptr + i, cumsum)
+        cumsum = cumsum + h
+    tl.store(expt_offs_ptr + N, cumsum)
+    
+    # 2. Compute token_offs_pad for each block size
+    for size_idx in tl.static_range(NUM_BLOCK_SIZES):
+        block_m_log2 = BLOCK_M_LOG2_START + size_idx
+        block_m = 1 << block_m_log2
+        
+        cumsum_pad = 0
         for i in tl.static_range(N):
             h = tl.sum(tl.where(offs_n == i, hist, 0))
-            tl.store(expt_offs_ptr + i, cumsum)
-            cumsum = cumsum + h
-        tl.store(expt_offs_ptr + N, cumsum)
-
-        for size_idx in tl.static_range(NUM_BLOCK_SIZES):
-            block_m_log2 = (
-                BLOCK_M_LOG2_START + size_idx
-            )  # 4, 5, 6, 7 (for 16, 32, 64, 128)
-            block_m = 1 << block_m_log2
-
-            cumsum_pad = 0
-            for i in tl.static_range(N):
-                h = tl.sum(tl.where(offs_n == i, hist, 0))
-                n_tiles = (h + block_m - 1) // block_m  # cdiv
-                offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
-                tl.store(offs_pad_ptr + i * stride_token_offs_n, cumsum_pad)
-                cumsum_pad = cumsum_pad + n_tiles
+            n_tiles = (h + block_m - 1) // block_m
             offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
-            tl.store(offs_pad_ptr + N * stride_token_offs_n, cumsum_pad)
+            tl.store(offs_pad_ptr + i * stride_token_offs_n, cumsum_pad)
+            cumsum_pad = cumsum_pad + n_tiles
+        offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
+        tl.store(offs_pad_ptr + N * stride_token_offs_n, cumsum_pad)
+    
+    # 3. Initialize block_pid_map
+    for size_idx in tl.static_range(NUM_BLOCK_SIZES):
+        pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pid_map_m
+        for tile_idx in range(max_n_tiles):
+            tl.store(pid_map_row_ptr + tile_idx * stride_pid_map_n, -1)
+    
+    # 4. Fill block_pid_map
+    for size_idx in tl.static_range(NUM_BLOCK_SIZES):
+        block_m_log2 = BLOCK_M_LOG2_START + size_idx
+        block_m = 1 << block_m_log2
+        
+        offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
+        pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pid_map_m
+        
+        for expert_id in range(N):
+            h = tl.load(hist_ptr + expert_id)
+            n_tiles = (h + block_m - 1) // block_m
+            tile_start = tl.load(offs_pad_ptr + expert_id * stride_token_offs_n)
+            
+            for block_idx in range(n_tiles):
+                packed_val = (block_idx << 16) | expert_id
+                tl.store(
+                    pid_map_row_ptr + (tile_start + block_idx) * stride_pid_map_n,
+                    packed_val,
+                )
 
-        for size_idx in tl.static_range(NUM_BLOCK_SIZES):
-            pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pid_map_m
-            for tile_idx in range(max_n_tiles):
-                tl.store(pid_map_row_ptr + tile_idx * stride_pid_map_n, -1)
 
-        for size_idx in tl.static_range(NUM_BLOCK_SIZES):
-            block_m_log2 = BLOCK_M_LOG2_START + size_idx
-            block_m = 1 << block_m_log2
-
-            offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
-            pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pid_map_m
-
-            for expert_id in range(N):
-                h = tl.load(hist_ptr + expert_id)
-                n_tiles = (h + block_m - 1) // block_m
-                tile_start = tl.load(offs_pad_ptr + expert_id * stride_token_offs_n)
-
-                for block_idx in range(n_tiles):
-                    # Pack (block_idx << 16) | expert_id
-                    packed_val = (block_idx << 16) | expert_id
-                    tl.store(
-                        pid_map_row_ptr + (tile_start + block_idx) * stride_pid_map_n,
-                        packed_val,
-                    )
-
-    _global_barrier_cas(barrier_ptr, num_programs, phase=1)
-
+# ============ Kernel 3: Compute Global Positions ============
+@triton.autotune(
+    configs=ROUTING_CONFIGS,  # 使用相同的配置空间！
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def phase3_global_positions(
+    weights_ptr, indices_ptr,
+    gate_scal_ptr, topk_index_ptr, gate_index_ptr,
+    expt_offs_ptr, partial_hist_ptr,
+    M, N, K, topk,
+    stride_weights_m, stride_weights_k,
+    stride_indices_m, stride_indices_k,
+    stride_partial_m, stride_partial_n,
+    ROWS_PER_PID: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, topk)
+    
+    # 1. Load expt_offs
     expt_offs = tl.load(expt_offs_ptr + offs_n)
-
+    
+    # 2. Compute prior_contrib
     prior_contrib = tl.zeros([N], dtype=tl.int32)
     for p in range(pid):
         prior_partial_ptr = partial_hist_ptr + p * stride_partial_m
         prior_hist = tl.load(prior_partial_ptr + offs_n * stride_partial_n)
         prior_contrib = prior_contrib + prior_hist
-
+    
+    # 3. Process rows
     local_offset = tl.zeros([N], dtype=tl.int32)
-
+    row_start = pid * ROWS_PER_PID
+    row_end = tl.minimum(row_start + ROWS_PER_PID, M)
+    
     for row_idx in range(row_start, row_end):
         weights_row_ptr = weights_ptr + row_idx * stride_weights_m
         indices_row_ptr = indices_ptr + row_idx * stride_indices_m
         weights = tl.load(weights_row_ptr + offs_k * stride_weights_k)
         expert_ids = tl.load(indices_row_ptr + offs_k * stride_indices_k).to(tl.int32)
-
+        
         for k in tl.static_range(topk):
             expert_id = tl.sum(tl.where(offs_k == k, expert_ids, 0))
             weight_val = tl.sum(tl.where(offs_k == k, weights, 0.0))
             flat_idx = row_idx * topk + k
-
+            
             expert_base = tl.sum(tl.where(offs_n == expert_id, expt_offs, 0))
             expert_prior = tl.sum(tl.where(offs_n == expert_id, prior_contrib, 0))
             expert_local = tl.sum(tl.where(offs_n == expert_id, local_offset, 0))
-
+            
             global_pos = expert_base + expert_prior + expert_local
-
+            
             tl.store(gate_scal_ptr + global_pos, weight_val)
             tl.store(topk_index_ptr + global_pos, flat_idx)
             tl.store(gate_index_ptr + flat_idx, global_pos)
-
+            
             local_offset = tl.where(offs_n == expert_id, local_offset + 1, local_offset)
 
 
-def fused_routing(
+# ============ Python Wrapper ============
+def fused_routing_3phase(
     router_logits: torch.Tensor,
     topk: int,
     renormalize: bool = True,
-) -> tuple["RoutingData", "GatherIndx", "ScatterIndx"]:
-    """
-    Fully fused topk, softmax, routing, and ExptData computation.
-    """
+) -> tuple:
     M, N = router_logits.shape
+    K = N
     device = router_logits.device
     dtype = router_logits.dtype
-
-    # Validate constraints
-    BLOCK_N = triton.next_power_of_2(N)
-    topk_padded = triton.next_power_of_2(topk)
-    assert (BLOCK_N == N) and (topk_padded == topk), (
-        f"N and topk must be power of 2, got N={N}, topk={topk}"
+    
+    # ===== 计算Grid配置 =====
+    # 这里使用启发式或简单策略来估计num_programs
+    device_props = torch.cuda.get_device_properties(device)
+    num_sms = device_props.multi_processor_count
+    
+    # 保守估计：使用最小的ROWS_PER_PID来计算最大的num_programs
+    MIN_ROWS_PER_PID = 16  # 从ROUTING_CONFIGS中取最小值
+    max_num_programs = min(
+        triton.cdiv(M, MIN_ROWS_PER_PID),
+        num_sms,
+        64  # 最大限制
     )
-
+    
+    # ===== 分配Buffers =====
     weights = torch.empty((M, topk), device=device, dtype=dtype)
     indices = torch.empty((M, topk), device=device, dtype=torch.int16)
     hist = torch.zeros(N, device=device, dtype=torch.int32)
     expt_offs = torch.empty(N + 1, device=device, dtype=torch.int32)
-
+    
+    # 使用保守的大小分配partial_hist
+    partial_hist = torch.zeros((max_num_programs, N), device=device, dtype=torch.int32)
+    
     n_gates = M * topk
     gate_scal = torch.empty(n_gates, device=device, dtype=dtype)
     topk_index = torch.empty(n_gates, device=device, dtype=torch.int32)
     gate_index = torch.empty(n_gates, device=device, dtype=torch.int32)
-
-    # block_m sizes: 16, 32, 64, 128 (NUM_BLOCK_SIZES=4)
+    
+    # ExptData相关
     BLOCK_M_LOG2_START = 4
     NUM_BLOCK_SIZES = 4
-
+    
     if n_gates <= N:
         max_n_tiles = n_gates
     else:
-        min_block_m = 1 << BLOCK_M_LOG2_START  # 16
+        min_block_m = 1 << BLOCK_M_LOG2_START
         max_n_tiles = N - 1 - ((N - n_gates - 1) // min_block_m)
-
-    token_offs_pad = torch.empty(
-        (NUM_BLOCK_SIZES, N + 1), device=device, dtype=torch.int32
-    )
-    block_pid_map = torch.full(
-        (NUM_BLOCK_SIZES, max_n_tiles), -1, device=device, dtype=torch.int32
-    )
-
-    barrier = torch.zeros(2, device=device, dtype=torch.int32)
-
-    device_props = torch.cuda.get_device_properties(device)
-    num_sms = device_props.multi_processor_count
-
-    max_num_programs = 64
-    ROWS_PER_PID = 4
-    desired_programs = triton.cdiv(M, ROWS_PER_PID)
-    num_programs = min(desired_programs, num_sms, max_num_programs)
-    ROWS_PER_PID = triton.cdiv(M, num_programs)
-
-    partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
-
-    _fused_topk_softmax_routing_kernel[(num_programs,)](
-        logits_ptr=router_logits,
-        stride_logits_m=router_logits.stride(0),
-        stride_logits_n=router_logits.stride(1),
-        weights_ptr=weights,
-        stride_weights_m=weights.stride(0),
-        stride_weights_k=weights.stride(1),
-        indices_ptr=indices,
-        stride_indices_m=indices.stride(0),
-        stride_indices_k=indices.stride(1),
-        hist_ptr=hist,
-        expt_offs_ptr=expt_offs,
-        partial_hist_ptr=partial_hist,
-        stride_partial_m=partial_hist.stride(0),
-        stride_partial_n=partial_hist.stride(1),
-        gate_scal_ptr=gate_scal,
-        topk_index_ptr=topk_index,
-        gate_index_ptr=gate_index,
-        token_offs_pad_ptr=token_offs_pad,
-        stride_token_offs_m=token_offs_pad.stride(0),
-        stride_token_offs_n=token_offs_pad.stride(1),
-        block_pid_map_ptr=block_pid_map,
-        stride_pid_map_m=block_pid_map.stride(0),
-        stride_pid_map_n=block_pid_map.stride(1),
-        max_n_tiles=max_n_tiles,
-        barrier_ptr=barrier,
-        M=M,
-        N=N,
-        topk=topk,
-        num_programs=num_programs,
+    
+    token_offs_pad = torch.empty((NUM_BLOCK_SIZES, N + 1), device=device, dtype=torch.int32)
+    block_pid_map = torch.full((NUM_BLOCK_SIZES, max_n_tiles), -1, device=device, dtype=torch.int32)
+    
+    # ===== Phase 1: TopK + Histogram =====
+    grid1 = lambda META: (triton.cdiv(M, META["ROWS_PER_PID"]),)
+    phase1_topk_and_hist[grid1](
+        router_logits, weights, indices,
+        hist, partial_hist,
+        M, N, K, topk,
+        router_logits.stride(0), router_logits.stride(1),
+        weights.stride(0), weights.stride(1),
+        indices.stride(0), indices.stride(1),
+        partial_hist.stride(0), partial_hist.stride(1),
         RENORM=renormalize,
-        ROWS_PER_PID=ROWS_PER_PID,
+    )
+    
+    # ===== Phase 2: Prefix Sum =====
+    phase2_prefix_sum[(1,)](
+        hist, expt_offs,
+        token_offs_pad, block_pid_map,
+        max_n_tiles,
+        token_offs_pad.stride(0), token_offs_pad.stride(1),
+        block_pid_map.stride(0), block_pid_map.stride(1),
+        N=N,
         NUM_BLOCK_SIZES=NUM_BLOCK_SIZES,
         BLOCK_M_LOG2_START=BLOCK_M_LOG2_START,
     )
-
+    
+    # ===== Phase 3: Global Positions =====
+    # 关键：使用相同的grid函数！
+    grid3 = lambda META: (triton.cdiv(M, META["ROWS_PER_PID"]),)
+    phase3_global_positions[grid3](
+        weights, indices,
+        gate_scal, topk_index, gate_index,
+        expt_offs, partial_hist,
+        M, N, K, topk,
+        weights.stride(0), weights.stride(1),
+        indices.stride(0), indices.stride(1),
+        partial_hist.stride(0), partial_hist.stride(1),
+    )
+    
+    # ===== 构造返回结果 =====
     gate_scal = gate_scal.to(torch.bfloat16)
     weights = weights.to(torch.bfloat16)
-
+    
     token_offs_pad_dict = {
         (1 << (BLOCK_M_LOG2_START + i)): token_offs_pad[i]
         for i in range(NUM_BLOCK_SIZES)
@@ -380,17 +848,16 @@ def fused_routing(
         (1 << (BLOCK_M_LOG2_START + i)): block_pid_map[i]
         for i in range(NUM_BLOCK_SIZES)
     }
-
-    # token_offs_raw is expt_offs[:N]
-    token_offs_raw = expt_offs[: N + 1]
-
+    
+    token_offs_raw = expt_offs[:N + 1]
+    
     expt_data = ExptData(
         hist=hist,
         token_offs_raw=token_offs_raw,
         token_offs_pad=token_offs_pad_dict,
         block_pid_map=block_pid_map_dict,
     )
-
+    
     gather_index = GatherIndx(topk_index, gate_index)
     scatter_index = ScatterIndx(gate_index, topk_index)
     routing_data = RoutingData(
@@ -400,8 +867,8 @@ def fused_routing(
         n_expts_act=topk,
         expt_data=expt_data,
     )
+    
     return routing_data, gather_index, scatter_index
-
 
 def triton_kernel_moe_forward(
     hidden_states: torch.Tensor,
@@ -416,7 +883,7 @@ def triton_kernel_moe_forward(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    routing_data, gather_idx, scatter_idx = fused_routing(
+    routing_data, gather_idx, scatter_idx = fused_routing_3phase(
         gating_output, topk, renormalize
     )
 
