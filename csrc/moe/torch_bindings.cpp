@@ -8,6 +8,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "token_expert_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
+  m.def(
+      "fused_routing(Tensor router_logits, Tensor! topk_weights, Tensor! "
+      "topk_indices,"
+      "Tensor! hist, Tensor! expt_offs, Tensor! partial_hist, Tensor! "
+      "gate_scale, Tensor! topk_index,"
+      "Tensor! gate_index, Tensor! token_offs_pad, Tensor! block_pid_map, int "
+      "max_n_tiles, int topk, bool renormalize) -> ()");
+  m.impl("fused_routing", torch::kCUDA, &fused_routing);
+
   // Calculate the result of moe by summing up the partial results
   // from all selected experts.
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");

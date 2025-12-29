@@ -1124,6 +1124,7 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool,
 ) -> tuple[torch.Tensor, ...]:
+    breakpoint()
     ops.topk_softmax(
         topk_weights,
         topk_indices,
@@ -1138,6 +1139,7 @@ def vllm_topk_softmax(
 def dispatch_topk_func(
     use_rocm_aiter: bool = False,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
+    breakpoint()
     if use_rocm_aiter:
         return rocm_aiter_ops.topk_softmax
     return vllm_topk_softmax

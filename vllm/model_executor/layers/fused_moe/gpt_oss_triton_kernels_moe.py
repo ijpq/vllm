@@ -7,6 +7,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import vllm_topk_softmax
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEQuantConfig,
@@ -23,6 +24,7 @@ logger = init_logger(__name__)
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
+        from triton.topk import topk_forward
         from triton_kernels.matmul_ogs import FnSpecs, FusedActivation, matmul_ogs
         from triton_kernels.routing import (
             ExptData,
@@ -31,7 +33,6 @@ if has_triton_kernels():
             ScatterIndx,
             routing_from_bitmatrix,
         )
-        from triton.topk import topk_forward
         from triton_kernels.tensor import Bitmatrix
     except (AttributeError, ImportError) as e:
         logger.error(
@@ -74,288 +75,10 @@ def pack_bitmatrix(
         tl.store(bitmatrix_ptrs, y, mask=offsets_m[:, None] < n_rows)
 
 
-@triton.jit
-def _global_barrier_cas(
-    barrier_ptr,
-    num_programs: tl.constexpr,
-    phase: tl.constexpr,
-):
-    counter_ptr = barrier_ptr + phase
-
-    # each pid increments counter when it arrives
-    arrived = tl.atomic_add(counter_ptr, 1, sem="acq_rel")
-
-    if arrived == num_programs - 1:
-        # last pid to arrive resets the counter
-        tl.atomic_xchg(counter_ptr, 0, sem="release")
-    else:
-        while tl.atomic_cas(counter_ptr, 0, 0) != 0:
-            pass
-
 
 @triton.jit
 def _cdiv(n, d):
     return (n + d - 1) // d
-
-# @triton.jit
-# def _topk_softmax(
-#     logits_ptr,
-#     stride_logits_m,
-#     stride_logits_n,
-#     weights_ptr,
-#     stride_weights_m,
-#     stride_weights_k,
-#     indices_ptr,
-#     stride_indices_m,
-#     stride_indices_k,
-#     M: tl.constexpr,
-#     N: tl.constexpr,
-#     topk: tl.constexpr,
-#     RENORM: tl.constexpr,
-#     hist_ptr,
-#     ROWS_PER_PID: tl.constexpr,
-#     num_program: tl.constexpr,
-#     pid,
-#     num_stages: tl.constexpr
-
-# ):
-
-#     offs_n = tl.arange(0, N)
-#     offs_k = tl.arange(0, topk)
-
-#     row_start = pid * ROWS_PER_PID
-#     row_end = tl.minimum(row_start + ROWS_PER_PID, M)
-#     rows = tl.arange(0, ROWS_PER_PID)
-#     local_hist = tl.zeros([N], dtype=tl.int32)
-#     # ld,st mask
-#     for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program, num_stages):
-#         row_mask = (row_idx + rows) < M
-#         ptr = logits_ptr + (row_idx + rows)[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
-#         logits = tl.load(ptr,mask=row_mask[:,None], other=float("-inf"))
-
-#         if not RENORM:
-#             logits = tl.softmax(logits, dim=1, keep_dims=True)
-
-#         topk_vals = tl.full([ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32)
-#         topk_idxs = tl.zeros([ROWS_PER_PID, topk], dtype=tl.int32)
-
-#         for k in tl.static_range(topk):
-#             cur_max = tl.max(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
-#             cur_idx = tl.argmax(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
-
-#             topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
-#             topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
-
-#             mask_selected = offs_n == cur_idx
-#             logits = tl.where(mask_selected, float("-inf"), logits)
-
-#         if RENORM:
-#             topk_vals = tl.softmax(topk_vals, dim=1, keep_dims=True)
-
-#         w_ptr = weights_ptr + (row_idx+rows)[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
-#         i_ptr = indices_ptr + (row_idx+rows)[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
-#         tl.store(w_ptr, topk_vals, mask=row_mask[:,None])
-#         tl.store(i_ptr, topk_idxs.to(tl.int16), mask=row_mask[:,None])
-
-#         for k in tl.static_range(topk):
-#             expert_id = tl.sum(tl.where(offs_k == k, topk_idxs, 0))
-#             tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
-#             local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
-    
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2]
-#         for num_stages in [1, 2]
-#     ],
-#     key=["N", "topk"],
-#     cache_results=True,
-# )
-@triton.jit
-def _fused_topk_softmax_routing_kernel(
-    logits_ptr,
-    stride_logits_m,
-    stride_logits_n,
-    weights_ptr,
-    stride_weights_m,
-    stride_weights_k,
-    indices_ptr,
-    stride_indices_m,
-    stride_indices_k,
-    hist_ptr,  # [N] global histogram
-    expt_offs_ptr,  # [N] prefix sum of histogram (token_offs_raw)
-    partial_hist_ptr,  # [num_programs, N] per-program histogram
-    stride_partial_m,
-    stride_partial_n,
-    gate_scal_ptr,  # [M * topk] reordered weights
-    topk_index_ptr,  # [M * topk] gather indices
-    gate_index_ptr,  # [M * topk] scatter indices
-    token_offs_pad_ptr,  # [NUM_BLOCK_SIZES, N+1] padded offsets for each block_m
-    stride_token_offs_m,
-    stride_token_offs_n,
-    block_pid_map_ptr,  # [NUM_BLOCK_SIZES, max_n_tiles] pid mapping
-    stride_pid_map_m,
-    stride_pid_map_n,
-    max_n_tiles,
-    barrier_ptr,  # [2] barrier counters
-    M: tl.constexpr,
-    N: tl.constexpr,  # num_experts
-    topk: tl.constexpr,
-    num_programs: tl.constexpr,
-    RENORM: tl.constexpr,
-    ROWS_PER_PID: tl.constexpr,
-    NUM_BLOCK_SIZES: tl.constexpr,  # number of block_m sizes (4 or 5)
-    BLOCK_M_LOG2_START: tl.constexpr,  # log2 of smallest block_m (4 for 16)
-    num_stages: tl.constexpr
-):
-    """
-    Fully fused kernel combining:
-    - Phase 1: topk + softmax + hist accumulation
-    - Phase 2: prefixsum + ExptData init (single program)
-    - Phase 3: gather/scatter indices + block_pid_map
-    """
-    pid = tl.program_id(0)
-    num_program = tl.num_programs(0)
-
-    offs_n = tl.arange(0, N)
-    offs_k = tl.arange(0, topk)
-
-    local_hist = tl.zeros([ N], dtype=tl.int32)
-
-    row_start = pid * ROWS_PER_PID
-    row_end = tl.minimum(row_start + ROWS_PER_PID, M)
-    rows = tl.arange(0, ROWS_PER_PID)
-
-    # ld,st mask
-    for row_idx in tl.range(row_start, M, ROWS_PER_PID * num_program):
-        row_mask = (row_idx + rows) < M
-        row_indices = row_idx + rows
-        ptr = logits_ptr +  row_indices[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n# [ROWS_PER_PID, 1] + [1,N]
-        logits = tl.load(ptr,mask=row_mask[:,None], other=float("-inf"))
-
-        if not RENORM:
-            logits = tl.softmax(logits, dim=1, keep_dims=True)
-
-        topk_vals = tl.full([ROWS_PER_PID, topk], float("-inf"), dtype=tl.float32)
-        topk_idxs = tl.zeros([ROWS_PER_PID, topk], dtype=tl.int32)
-
-        for k in tl.static_range(topk):
-            cur_max = tl.max(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
-            cur_idx = tl.argmax(logits, axis=1, keep_dims=True) # [ROWSPERPID,1]
-
-            topk_vals = tl.where(offs_k == k, cur_max, topk_vals)
-            topk_idxs = tl.where(offs_k == k, cur_idx, topk_idxs)
-
-            mask_selected = offs_n[None,:] == cur_idx
-            logits = tl.where(mask_selected, float("-inf"), logits)
-
-        if RENORM:
-            topk_vals = tl.softmax(topk_vals, dim=1, keep_dims=True)
-
-        w_ptr = weights_ptr + row_indices[:, None] * stride_weights_m + offs_k[None, :] * stride_weights_k
-        i_ptr = indices_ptr + row_indices[:, None] * stride_indices_m + offs_k[None, :] * stride_indices_k
-        tl.store(w_ptr, topk_vals, mask=row_mask[:,None])
-        tl.store(i_ptr, topk_idxs, mask=row_mask[:,None])
-
-
-        for row in tl.static_range(ROWS_PER_PID):
-            if row_idx + row < M:
-                for k in tl.static_range(topk):
-                    mask = (rows[:, None] == row) & (offs_k[None, :] == k)
-                    expert_id = tl.sum(tl.where(mask, topk_idxs, 0))
-                    tl.atomic_add(hist_ptr + expert_id, 1, sem="relaxed")
-                    local_hist = tl.where(offs_n == expert_id, local_hist + 1, local_hist)
-
-    partial_hist_row_ptr = partial_hist_ptr + pid * stride_partial_m
-    tl.store(partial_hist_row_ptr + offs_n * stride_partial_n, local_hist)
-
-    _global_barrier_cas(barrier_ptr, num_programs, phase=0)
-
-    if pid == 0:
-        hist = tl.load(hist_ptr + offs_n)
-
-        cumsum = 0
-        for i in tl.static_range(N):
-            h = tl.sum(tl.where(offs_n == i, hist, 0))
-            tl.store(expt_offs_ptr + i, cumsum)
-            cumsum = cumsum + h
-        tl.store(expt_offs_ptr + N, cumsum)
-
-        for size_idx in tl.static_range(NUM_BLOCK_SIZES):
-            block_m_log2 = (
-                BLOCK_M_LOG2_START + size_idx
-            )  # 4, 5, 6, 7 (for 16, 32, 64, 128)
-            block_m = 1 << block_m_log2
-
-            cumsum_pad = 0
-            for i in tl.static_range(N):
-                h = tl.sum(tl.where(offs_n == i, hist, 0))
-                n_tiles = (h + block_m - 1) // block_m  # cdiv
-                offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
-                tl.store(offs_pad_ptr + i * stride_token_offs_n, cumsum_pad)
-                cumsum_pad = cumsum_pad + n_tiles
-            offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
-            tl.store(offs_pad_ptr + N * stride_token_offs_n, cumsum_pad)
-
-        for size_idx in tl.static_range(NUM_BLOCK_SIZES):
-            pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pid_map_m
-            for tile_idx in range(max_n_tiles):
-                tl.store(pid_map_row_ptr + tile_idx * stride_pid_map_n, -1)
-
-        for size_idx in tl.static_range(NUM_BLOCK_SIZES):
-            block_m_log2 = BLOCK_M_LOG2_START + size_idx
-            block_m = 1 << block_m_log2
-
-            offs_pad_ptr = token_offs_pad_ptr + size_idx * stride_token_offs_m
-            pid_map_row_ptr = block_pid_map_ptr + size_idx * stride_pid_map_m
-
-            for expert_id in range(N):
-                h = tl.load(hist_ptr + expert_id)
-                n_tiles = (h + block_m - 1) // block_m
-                tile_start = tl.load(offs_pad_ptr + expert_id * stride_token_offs_n)
-
-                for block_idx in range( n_tiles):
-                    # Pack (block_idx << 16) | expert_id
-                    packed_val = (block_idx << 16) | expert_id
-                    tl.store(
-                        pid_map_row_ptr + (tile_start + block_idx) * stride_pid_map_n,
-                        packed_val,
-                    )
-
-    _global_barrier_cas(barrier_ptr, num_programs, phase=1)
-
-    expt_offs = tl.load(expt_offs_ptr + offs_n)
-
-    prior_contrib = tl.zeros([N], dtype=tl.int32)
-    for p in range( pid):
-        prior_partial_ptr = partial_hist_ptr + p * stride_partial_m
-        prior_hist = tl.load(prior_partial_ptr + offs_n * stride_partial_n)
-        prior_contrib = prior_contrib + prior_hist
-
-    local_offset = tl.zeros([N], dtype=tl.int32)
-
-    for row_idx in range(row_start, row_end):
-        weights_row_ptr = weights_ptr + row_idx * stride_weights_m
-        indices_row_ptr = indices_ptr + row_idx * stride_indices_m
-        weights = tl.load(weights_row_ptr + offs_k * stride_weights_k)
-        expert_ids = tl.load(indices_row_ptr + offs_k * stride_indices_k).to(tl.int32)
-
-        for k in tl.static_range(topk):
-            expert_id = tl.sum(tl.where(offs_k == k, expert_ids, 0))
-            weight_val = tl.sum(tl.where(offs_k == k, weights, 0.0))
-            flat_idx = row_idx * topk + k
-
-            expert_base = tl.sum(tl.where(offs_n == expert_id, expt_offs, 0))
-            expert_prior = tl.sum(tl.where(offs_n == expert_id, prior_contrib, 0))
-            expert_local = tl.sum(tl.where(offs_n == expert_id, local_offset, 0))
-
-            global_pos = expert_base + expert_prior + expert_local
-
-            tl.store(gate_scal_ptr + global_pos, weight_val)
-            tl.store(topk_index_ptr + global_pos, flat_idx)
-            tl.store(gate_index_ptr + flat_idx, global_pos)
-
-            local_offset = tl.where(offs_n == expert_id, local_offset + 1, local_offset)
 
 
 def fused_routing(
@@ -377,13 +100,17 @@ def fused_routing(
         f"N and topk must be power of 2, got N={N}, topk={topk}"
     )
 
-    weights = torch.empty((M, topk), device=device, dtype=dtype)
-    indices = torch.empty((M, topk), device=device, dtype=torch.int16)
+    topk_weights = torch.empty((M, topk), device=device, dtype=dtype)
+    topk_indices = torch.empty((M, topk), device=device, dtype=torch.int16)
+    token_expert_indices = torch.empty(
+        M, topk, dtype=torch.int32, device=router_logits.device
+    )
+
     hist = torch.zeros(N, device=device, dtype=torch.int32)
     expt_offs = torch.empty(N + 1, device=device, dtype=torch.int32)
 
     n_gates = M * topk
-    gate_scal = torch.empty(n_gates, device=device, dtype=dtype)
+    gate_scale = torch.empty(n_gates, device=device, dtype=dtype)
     topk_index = torch.empty(n_gates, device=device, dtype=torch.int32)
     gate_index = torch.empty(n_gates, device=device, dtype=torch.int32)
 
@@ -418,45 +145,30 @@ def fused_routing(
 
     partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
 
-    _fused_topk_softmax_routing_kernel[(num_programs,)](
-        logits_ptr=router_logits,
-        stride_logits_m=router_logits.stride(0),
-        stride_logits_n=router_logits.stride(1),
-        weights_ptr=weights,
-        stride_weights_m=weights.stride(0),
-        stride_weights_k=weights.stride(1),
-        indices_ptr=indices,
-        stride_indices_m=indices.stride(0),
-        stride_indices_k=indices.stride(1),
-        hist_ptr=hist,
-        expt_offs_ptr=expt_offs,
-        partial_hist_ptr=partial_hist,
-        stride_partial_m=partial_hist.stride(0),
-        stride_partial_n=partial_hist.stride(1),
-        gate_scal_ptr=gate_scal,
-        topk_index_ptr=topk_index,
-        gate_index_ptr=gate_index,
-        token_offs_pad_ptr=token_offs_pad,
-        stride_token_offs_m=token_offs_pad.stride(0),
-        stride_token_offs_n=token_offs_pad.stride(1),
-        block_pid_map_ptr=block_pid_map,
-        stride_pid_map_m=block_pid_map.stride(0),
-        stride_pid_map_n=block_pid_map.stride(1),
-        max_n_tiles=max_n_tiles,
-        barrier_ptr=barrier,
-        M=M,
-        N=N,
-        topk=topk,
-        num_programs=num_programs,
-        RENORM=renormalize,
-        ROWS_PER_PID=ROWS_PER_PID,
-        NUM_BLOCK_SIZES=NUM_BLOCK_SIZES,
-        BLOCK_M_LOG2_START=BLOCK_M_LOG2_START,
-        num_stages=1,
+    # XXX: Since we have fused topk+softmax kernel, leave it outside
+    topk_weights, topk_indices = vllm_topk_softmax(
+        topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
     )
 
-    gate_scal = gate_scal.to(torch.bfloat16)
-    weights = weights.to(torch.bfloat16)
+    ops.fused_routing(
+        router_logits,
+        topk_weights,
+        topk_indices,
+        hist,
+        expt_offs,
+        partial_hist,
+        gate_scale,
+        topk_index,
+        gate_index,
+        token_offs_pad,
+        block_pid_map,
+        max_n_tiles,
+        topk,
+        renormalize,
+    )
+
+    gate_scale = gate_scale.to(torch.bfloat16)
+    topk_weights = topk_weights.to(torch.bfloat16)
 
     token_offs_pad_dict = {
         (1 << (BLOCK_M_LOG2_START + i)): token_offs_pad[i]
