@@ -244,6 +244,17 @@ class cmake_build_ext(build_ext):
         ]
 
         subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+        source_json = os.path.join(self.build_temp, "compile_commands.json")
+        
+        target_dir = os.path.join(ROOT_DIR, "build") 
+        target_json = os.path.join(target_dir, "compile_commands.json")
+
+        if os.path.exists(source_json):
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy(source_json, target_json)
+            print(f"-- Copying compile_commands.json to {target_json}")
+        else:
+            print(f"-- Warning: compile_commands.json not found in {self.build_temp}")
 
         # Install the libraries
         for ext in self.extensions:

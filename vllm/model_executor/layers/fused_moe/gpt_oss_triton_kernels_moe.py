@@ -93,13 +93,6 @@ def fused_routing(
     device = router_logits.device
     dtype = router_logits.dtype
 
-    # Validate constraints
-    BLOCK_N = triton.next_power_of_2(N)
-    topk_padded = triton.next_power_of_2(topk)
-    assert (BLOCK_N == N) and (topk_padded == topk), (
-        f"N and topk must be power of 2, got N={N}, topk={topk}"
-    )
-
     topk_weights = torch.empty((M, topk), device=device, dtype=dtype)
     topk_indices = torch.empty((M, topk), device=device, dtype=torch.int16)
     token_expert_indices = torch.empty(
@@ -131,19 +124,18 @@ def fused_routing(
         (NUM_BLOCK_SIZES, max_n_tiles), -1, device=device, dtype=torch.int32
     )
 
-    barrier = torch.zeros(2, device=device, dtype=torch.int32)
 
-    device_props = torch.cuda.get_device_properties(device)
-    num_sms = device_props.multi_processor_count
+    # device_props = torch.cuda.get_device_properties(device)
+    # num_sms = device_props.multi_processor_count
 
-    max_num_programs = 64
-    ROWS_PER_PID = 4
-    desired_programs = triton.cdiv(M, ROWS_PER_PID)
-    num_programs = min(desired_programs, num_sms, max_num_programs)
-    ROWS_PER_PID = triton.cdiv(M, num_programs)
+    # max_num_programs = 64
+    # ROWS_PER_PID = 4
+    # desired_programs = triton.cdiv(M, ROWS_PER_PID)
+    # num_programs = min(desired_programs, num_sms, max_num_programs)
+    # ROWS_PER_PID = triton.cdiv(M, num_programs)
     # hist = torch.zeros((ROWS_PER_PID,N), device=device, dtype=torch.int32)
 
-    partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
+    # partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
 
     # XXX: Since we have fused topk+softmax kernel, leave it outside
     topk_weights, topk_indices = vllm_topk_softmax(
@@ -154,17 +146,15 @@ def fused_routing(
         router_logits,
         topk_weights,
         topk_indices,
-        hist,
-        expt_offs,
-        partial_hist,
+        max_n_tiles,
+        topk,
+        renormalize,
         gate_scale,
         topk_index,
         gate_index,
         token_offs_pad,
         block_pid_map,
-        max_n_tiles,
-        topk,
-        renormalize,
+        expt_offs
     )
 
     gate_scale = gate_scale.to(torch.bfloat16)
@@ -179,12 +169,11 @@ def fused_routing(
         for i in range(NUM_BLOCK_SIZES)
     }
 
-    # token_offs_raw is expt_offs[:N]
-    token_offs_raw = expt_offs[: N + 1]
+    # token_offs_raw = expt_offs[: N + 1]
 
     expt_data = ExptData(
         hist=hist,
-        token_offs_raw=token_offs_raw,
+        token_offs_raw=expt_offs,
         token_offs_pad=token_offs_pad_dict,
         block_pid_map=block_pid_map_dict,
     )
@@ -192,7 +181,7 @@ def fused_routing(
     gather_index = GatherIndx(topk_index, gate_index)
     scatter_index = ScatterIndx(gate_index, topk_index)
     routing_data = RoutingData(
-        gate_scal=gate_scal,
+        gate_scal=gate_scale,
         expt_hist=hist,
         n_expts_tot=N,
         n_expts_act=topk,

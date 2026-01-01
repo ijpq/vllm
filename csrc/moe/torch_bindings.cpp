@@ -10,11 +10,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
 
   m.def(
       "fused_routing(Tensor router_logits, Tensor! topk_weights, Tensor! "
-      "topk_indices,"
-      "Tensor! hist, Tensor! expt_offs, Tensor! partial_hist, Tensor! "
-      "gate_scale, Tensor! topk_index,"
-      "Tensor! gate_index, Tensor! token_offs_pad, Tensor! block_pid_map, int "
-      "max_n_tiles, int topk, bool renormalize) -> ()");
+      "topk_indices, int max_n_tiles, int topk,"
+      " Tensor! gate_scale, Tensor! topk_index,"
+      "Tensor! gate_index, Tensor! token_offs_pad, Tensor! block_pid_map, "
+      "Tensor! expt_offs) -> ()");
   m.impl("fused_routing", torch::kCUDA, &fused_routing);
 
   // Calculate the result of moe by summing up the partial results
