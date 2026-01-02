@@ -1,6 +1,5 @@
 #include <type_traits>
 #include <torch/all.h>
-#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "../cuda_compat.h"
@@ -262,7 +261,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
       auto topk_weights_ptr = topk_weights.data_ptr<float>();
       auto topk_indices_ptr = topk_indices.data_ptr<int16_t>();
       auto gate_scale_ptr = gate_scale.data_ptr<float>();
-      auto topk_index_ptr = topk_index.data_ptr<int32_t>();
+      auto topk_index_ptr = topk_index.data_ptr<int16_t>();
       auto gate_index_ptr = gate_index.data_ptr<int32_t>();
       auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
       auto block_pid_map_ptr = block_pid_map.data_ptr<int32_t>();
