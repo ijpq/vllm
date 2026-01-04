@@ -3055,3 +3055,30 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
+
+def fused_routing(
+    gating_output,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    max_n_tiles,
+    topk,
+    gate_scale,
+    topk_index,
+    gate_index,
+    token_offs_pad,
+    block_pid_map,
+    expt_offs
+) -> None:
+    torch.ops._moe_C.fused_routing(
+    gating_output,
+    topk_weights,
+    topk_ids,
+    max_n_tiles,
+    topk,
+    gate_scale,
+    topk_index,
+    gate_index,
+    token_offs_pad,
+    block_pid_map,
+    expt_offs
+    )

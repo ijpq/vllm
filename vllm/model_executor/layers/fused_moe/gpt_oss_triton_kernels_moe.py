@@ -24,7 +24,6 @@ logger = init_logger(__name__)
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
-        from triton.topk import topk_forward
         from triton_kernels.matmul_ogs import FnSpecs, FusedActivation, matmul_ogs
         from triton_kernels.routing import (
             ExptData,
@@ -93,8 +92,8 @@ def fused_routing(
     device = router_logits.device
     dtype = router_logits.dtype
 
-    topk_weights = torch.empty((M, topk), device=device, dtype=dtype)
-    topk_indices = torch.empty((M, topk), device=device, dtype=torch.int16)
+    topk_weights = torch.empty((M, topk), device=device, dtype=torch.float)
+    topk_indices = torch.empty((M, topk), device=device, dtype=torch.int)
     token_expert_indices = torch.empty(
         M, topk, dtype=torch.int32, device=router_logits.device
     )
@@ -138,17 +137,17 @@ def fused_routing(
     # partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
 
     # XXX: Since we have fused topk+softmax kernel, leave it outside
-    topk_weights, topk_indices = ops.topk_softmax(
+    ops.topk_softmax(
         topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
     )
+    print("finish topk_softmax")
 
     ops.fused_routing(
         router_logits,
-        topk_weights,
-        topk_indices,
+        topk_weights.to(torch.float),
+        topk_indices.to(torch.int16),
         max_n_tiles,
         topk,
-        renormalize,
         gate_scale,
         topk_index,
         gate_index,
