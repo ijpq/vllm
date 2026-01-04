@@ -7,7 +7,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import vllm_topk_softmax
+# from vllm.model_executor.layers.fused_moe import vllm_topk_softmax
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEQuantConfig,
@@ -138,7 +138,7 @@ def fused_routing(
     # partial_hist = torch.zeros((num_programs, N), device=device, dtype=torch.int32)
 
     # XXX: Since we have fused topk+softmax kernel, leave it outside
-    topk_weights, topk_indices = vllm_topk_softmax(
+    topk_weights, topk_indices = ops.topk_softmax(
         topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
     )
 
@@ -205,13 +205,13 @@ def triton_kernel_moe_forward(
 ) -> torch.Tensor:
     num_tokens = hidden_states.size(0)
     if num_tokens > 1024*8:
-    routing_data, gather_idx, scatter_idx = routing(
-        gating_output, topk, renormalize
-    )
-     else:   
-    routing_data, gather_idx, scatter_idx = fused_routing(
-        gating_output, topk, renormalize
-    )
+        routing_data, gather_idx, scatter_idx = routing(
+            gating_output, topk, renormalize
+        )
+    else:   
+        routing_data, gather_idx, scatter_idx = fused_routing(
+            gating_output, topk, renormalize
+        )
 
     output = torch.empty_like(hidden_states)
 

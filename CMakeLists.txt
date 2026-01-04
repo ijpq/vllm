@@ -1059,6 +1059,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 message(STATUS "Enabling moe extension.")
+message(STATUS "included files: ${VLLM_MOE_EXT_SRC}")
 define_extension_target(
   _moe_C
   DESTINATION vllm

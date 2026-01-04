@@ -98,7 +98,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         // ensure threads LGT num tokens
         // for (int i = tid; i < NUM_TOKENS; i += num_threads) {
         int64_t row_experts =
-            *reinterpret_cast<int64_t*>(topk_indices + i * topk);
+            *reinterpret_cast<int64_t*>(topk_indices + tid * topk);
         auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
         auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
         auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
@@ -309,12 +309,12 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
             auto block_pid_map_ptr = block_pid_map.data_ptr<int32_t>();
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
 
-            size_t global_hist_size = NUM_EXPERTS;
-            size_t local_hist_size = NUM_EXPERTS;
-            size_t global_hist_prefix_size = NUM_EXPERTS + 1;
-            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
+            size_t global_hist_size = num_experts;
+            size_t local_hist_size = num_experts;
+            size_t global_hist_prefix_size = num_experts + 1;
+            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
-            size_t prefix_experts_size = NUM_EXPERTS;
+            size_t prefix_experts_size = num_experts;
             config.dynamicSmemBytes =
                 (global_hist_size + local_hist_size + global_hist_prefix_size +
                 token_offs_pad_size + block_pid_size + prefix_experts_size) * sizeof(int32_t);
