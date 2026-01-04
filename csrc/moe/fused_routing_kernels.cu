@@ -21,13 +21,15 @@ namespace moe {
 
 // IndexType <- int16*
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
-__global__ void fused_routing_kernel(
-     float* __restrict__ topk_weights,
-    int16_t* __restrict__ topk_indices, int64_t max_n_tiles, int64_t NUM_TOKENS,
-    float* __restrict__ gate_scale, int16_t* __restrict__ topk_index,
-    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
-    int32_t* __restrict__ block_pid_map_ptr,
-    int32_t* __restrict__ expt_offs_ptr);
+__global__ void fused_routing_kernel(float* __restrict__ topk_weights,
+                                     int16_t* __restrict__ topk_indices,
+                                     int64_t max_n_tiles, int64_t NUM_TOKENS,
+                                     float* __restrict__ gate_scale,
+                                     int16_t* __restrict__ topk_index,
+                                     int32_t* __restrict__ gate_index,
+                                     int32_t* __restrict__ token_offs_pad_ptr,
+                                     int32_t* __restrict__ block_pid_map_ptr,
+                                     int32_t* __restrict__ expt_offs_ptr);
 
 // template<>
 // __global__
@@ -42,10 +44,10 @@ __global__ void fused_routing_kernel(
 
 template <>
 __global__ void fused_routing_kernel<32, 4, 4>(
-    float* __restrict__ topk_weights,
-    int16_t* __restrict__ topk_indices, int64_t max_n_tiles, int64_t NUM_TOKENS,
-    float* __restrict__ gate_scale, int16_t* __restrict__ topk_index,
-    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
+    float* __restrict__ topk_weights, int16_t* __restrict__ topk_indices,
+    int64_t max_n_tiles, int64_t NUM_TOKENS, float* __restrict__ gate_scale,
+    int16_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
+    int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr) {
     namespace cg = cooperative_groups;
@@ -229,8 +231,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         int32_t* hist_sum = reinterpret_cast<int32_t*>(
             sm_hist + global_hist_exclusivesum_offset);
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
-        if ( local_tid == 0)
-            expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
+        if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
 
     /* phase 3*/
@@ -240,7 +241,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         0);
     // if (tid < NUM_TOKENS) {
     for (int i = tid; i < NUM_TOKENS; i += num_threads) {
-
         int32_t* prior_contrib =
             reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
         int topk_idx_stride = topk, topk_val_stride = topk;
@@ -266,7 +266,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
 }  // namespace moe
 }  // namespace vllm
 
-
 void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                    torch::Tensor& topk_indices, int64_t max_n_tiles,
                    int64_t topk, torch::Tensor& gate_scale,
@@ -282,24 +281,44 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
         case 32: {
             auto warp_size = 32;
             int cluster_size = 0;
-            cudaLaunchConfig_t config = {0};
-            auto kernel_wrapper = &(vllm::moe::fused_routing_kernel<32, const_topk, NUM_BLOCK_SIZES>);
-                
-            assert(cudaFuncSetAttribute(kernel_wrapper, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) ==0);
-            assert(cudaOccupancyMaxPotentialClusterSize(&cluster_size, kernel_wrapper, config) == 0);
+            cudaLaunchConfig_t config = {};
+            auto kernel_wrapper =
+                &(vllm::moe::fused_routing_kernel<32, const_topk,
+                                                  NUM_BLOCK_SIZES>);
+
+            size_t global_hist_size = num_experts;
+            size_t local_hist_size = num_experts;
+            size_t global_hist_prefix_size = num_experts + 1;
+            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
+            size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
+            size_t prefix_experts_size = num_experts;
+            config.dynamicSmemBytes =
+                (global_hist_size + local_hist_size + global_hist_prefix_size +
+                 token_offs_pad_size + block_pid_size + prefix_experts_size) *
+                sizeof(int32_t);
+
+            config.blockDim = dim3(1024, 1, 1);
+            assert(cudaFuncSetAttribute(
+                       kernel_wrapper,
+                       cudaFuncAttributeNonPortableClusterSizeAllowed, 1) == 0);
+            assert(cudaOccupancyMaxPotentialClusterSize(
+                       &cluster_size, kernel_wrapper, config) == 0);
             // The grid dimension is not affected by cluster launch, and is
             // still enumerated using number of blocks. The grid dimension
             // should be a multiple of cluster size.
+            assert(cluster_size != 0 && "unexpected 0");
             auto grid_dim = dim3(cluster_size, 1, 1);
-            int threads_per_block =  (num_tokens + grid_dim.x - 1) / grid_dim.x;
-            assert(threads_per_block <= 1024 && "if so fallback to triton_kernels");
+            int threads_per_block = (num_tokens + grid_dim.x - 1) / grid_dim.x;
+            assert(threads_per_block <= 1024 &&
+                   "if so fallback to triton_kernels");
             auto block_dim = dim3(threads_per_block, 1, 1);
             config.blockDim = block_dim;
             config.gridDim = grid_dim;
 
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeClusterDimension;
-            attribute[0].val.clusterDim.x = grid_dim.x;  // Cluster size in X-dimension
+            attribute[0].val.clusterDim.x =
+                grid_dim.x;  // Cluster size in X-dimension
             attribute[0].val.clusterDim.y = 1;
             attribute[0].val.clusterDim.z = 1;
             config.attrs = attribute;
@@ -314,21 +333,11 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
             auto block_pid_map_ptr = block_pid_map.data_ptr<int32_t>();
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
 
-            size_t global_hist_size = num_experts;
-            size_t local_hist_size = num_experts;
-            size_t global_hist_prefix_size = num_experts + 1;
-            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
-            size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
-            size_t prefix_experts_size = num_experts;
-            config.dynamicSmemBytes =
-                (global_hist_size + local_hist_size + global_hist_prefix_size +
-                token_offs_pad_size + block_pid_size + prefix_experts_size) * sizeof(int32_t);
-            cudaLaunchKernelEx(
-                &config, kernel_wrapper,
-                 topk_weights_ptr, topk_indices_ptr,
-                max_n_tiles, num_tokens, gate_scale_ptr, topk_index_ptr,
-                gate_index_ptr, token_offs_pad_ptr, block_pid_map_ptr,
-                expt_offs_ptr);
+            cudaLaunchKernelEx(&config, kernel_wrapper, topk_weights_ptr,
+                               topk_indices_ptr, max_n_tiles, num_tokens,
+                               gate_scale_ptr, topk_index_ptr, gate_index_ptr,
+                               token_offs_pad_ptr, block_pid_map_ptr,
+                               expt_offs_ptr);
             break;
         }
         case 128: {
