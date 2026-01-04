@@ -203,6 +203,12 @@ def triton_kernel_moe_forward(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    num_tokens = hidden_states.size(0)
+    if num_tokens > 1024*8:
+    routing_data, gather_idx, scatter_idx = routing(
+        gating_output, topk, renormalize
+    )
+     else:   
     routing_data, gather_idx, scatter_idx = fused_routing(
         gating_output, topk, renormalize
     )
