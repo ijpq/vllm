@@ -102,7 +102,7 @@ def fused_routing(
     expt_offs = torch.empty(N + 1, device=device, dtype=torch.int32)
 
     n_gates = M * topk
-    gate_scale = torch.empty(n_gates, device=device, dtype=dtype)
+    gate_scale = torch.empty(n_gates, device=device, dtype=torch.float)
     topk_index = torch.empty(n_gates, device=device, dtype=torch.int32)
     gate_index = torch.empty(n_gates, device=device, dtype=torch.int32)
 
@@ -140,7 +140,6 @@ def fused_routing(
     ops.topk_softmax(
         topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
     )
-    print("finish topk_softmax")
 
     ops.fused_routing(
         router_logits,

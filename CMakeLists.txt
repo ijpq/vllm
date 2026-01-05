@@ -948,8 +948,7 @@ target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 set(VLLM_MOE_EXT_SRC
   "csrc/moe/torch_bindings.cpp"
   "csrc/moe/moe_align_sum_kernels.cu"
-  "csrc/moe/topk_softmax_kernels.cu"
-  "csrc/moe/fused_routing_kernels.cu")
+  "csrc/moe/topk_softmax_kernels.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
@@ -976,6 +975,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_MOE_WNA16_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
+
+  cuda_archs_loose_intersection(CLUSTER_ARCHS "9.0a" "${CUDA_ARCHS}")
+  if(CLUSTER_ARCHS)
+    set(FUSED_ROUTING_SRC "csrc/moe/fused_routing_kernels.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${FUSED_ROUTING_SRC}"
+      CUDA_ARCHS "${CLUSTER_ARCHS}")
+    message(STATUS "Building fused_routing with cluster support for archs: ${CLUSTER_ARCHS}")
+  else()
+    message(STATUS "exclude fused_routing ${CUDA_ARCHS}, ${CLUSTER_ARCHS}")
+  endif()
 
   list(APPEND VLLM_MOE_EXT_SRC "${VLLM_MOE_WNA16_SRC}")
   # moe marlin arches
@@ -1064,7 +1074,7 @@ define_extension_target(
   _moe_C
   DESTINATION vllm
   LANGUAGE ${VLLM_GPU_LANG}
-  SOURCES ${VLLM_MOE_EXT_SRC}
+  SOURCES ${VLLM_MOE_EXT_SRC} ${FUSED_ROUTING_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}

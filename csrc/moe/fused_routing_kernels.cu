@@ -15,7 +15,6 @@
 typedef __hip_bfloat16 __nv_bfloat16;
 typedef __hip_bfloat162 __nv_bfloat162;
 #endif
-
 namespace vllm {
 namespace moe {
 
@@ -25,7 +24,7 @@ __global__ void fused_routing_kernel(float* __restrict__ topk_weights,
                                      int16_t* __restrict__ topk_indices,
                                      int64_t max_n_tiles, int64_t NUM_TOKENS,
                                      float* __restrict__ gate_scale,
-                                     int16_t* __restrict__ topk_index,
+                                     int32_t* __restrict__ topk_index,
                                      int32_t* __restrict__ gate_index,
                                      int32_t* __restrict__ token_offs_pad_ptr,
                                      int32_t* __restrict__ block_pid_map_ptr,
@@ -46,7 +45,7 @@ template <>
 __global__ void fused_routing_kernel<32, 4, 4>(
     float* __restrict__ topk_weights, int16_t* __restrict__ topk_indices,
     int64_t max_n_tiles, int64_t NUM_TOKENS, float* __restrict__ gate_scale,
-    int16_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
+    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr) {
@@ -297,12 +296,17 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                  token_offs_pad_size + block_pid_size + prefix_experts_size) *
                 sizeof(int32_t);
 
-            config.blockDim = dim3(1024, 1, 1);
-            assert(cudaFuncSetAttribute(
-                       kernel_wrapper,
-                       cudaFuncAttributeNonPortableClusterSizeAllowed, 1) == 0);
-            assert(cudaOccupancyMaxPotentialClusterSize(
-                       &cluster_size, kernel_wrapper, config) == 0);
+            config.blockDim = dim3(512, 1, 1);
+            LOG(INFO) << "Req Smem: " << config.dynamicSmemBytes << " bytes"
+                      ;
+            cudaFuncSetAttribute(kernel_wrapper,
+                                 cudaFuncAttributeNonPortableClusterSizeAllowed,
+                                 1);
+            cudaError_t err = cudaOccupancyMaxPotentialClusterSize(
+                &cluster_size, kernel_wrapper, &config);
+            LOG(INFO) << "cudaOccupancyMaxPotentialClusterSize returned: "
+                      << cudaGetErrorString(err) << std::endl;
+            LOG(INFO) << "cluster size" << cluster_size << std::endl;
             // The grid dimension is not affected by cluster launch, and is
             // still enumerated using number of blocks. The grid dimension
             // should be a multiple of cluster size.
@@ -327,7 +331,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
             auto topk_weights_ptr = topk_weights.data_ptr<float>();
             auto topk_indices_ptr = topk_indices.data_ptr<int16_t>();
             auto gate_scale_ptr = gate_scale.data_ptr<float>();
-            auto topk_index_ptr = topk_index.data_ptr<int16_t>();
+            auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
             auto block_pid_map_ptr = block_pid_map.data_ptr<int32_t>();
