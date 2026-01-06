@@ -20,10 +20,10 @@ namespace moe {
 
 // IndexType <- int16*
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
-__global__ void fused_routing_kernel(float* __restrict__ topk_weights,
+__global__ void fused_routing_kernel(__nv_bfloat16* __restrict__ topk_weights,
                                      int16_t* __restrict__ topk_indices,
                                      int64_t max_n_tiles, int64_t NUM_TOKENS,
-                                     float* __restrict__ gate_scale,
+                                     __nv_bfloat16* __restrict__ gate_scale,
                                      int32_t* __restrict__ topk_index,
                                      int32_t* __restrict__ gate_index,
                                      int32_t* __restrict__ token_offs_pad_ptr,
@@ -43,8 +43,8 @@ __global__ void fused_routing_kernel(float* __restrict__ topk_weights,
 
 template <>
 __global__ void fused_routing_kernel<32, 4, 4>(
-    float* __restrict__ topk_weights, int16_t* __restrict__ topk_indices,
-    int64_t max_n_tiles, int64_t NUM_TOKENS, float* __restrict__ gate_scale,
+    __nv_bfloat16* __restrict__ topk_weights, int16_t* __restrict__ topk_indices,
+    int64_t max_n_tiles, int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
     int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
@@ -87,7 +87,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         sm_hist[i] = 0;
     }
     // __syncthreads();
-    cluster.sync();  // we need to ensure global hist had been memset.
+    cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
     /*phase 1*/
     int my_local_offset[topk];
@@ -248,7 +248,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
 #pragma unroll
         for (int k = 0; k < topk; k++) {
             int expert_id = topk_indices[i * topk_idx_stride + k];
-            int val = topk_weights[i * topk_val_stride + k];
+            __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
             int flat_idx = i * topk + k;
             int expert_base = hist_sum[expert_id];
             int expert_prior = prior_contrib[expert_id];
@@ -328,9 +328,9 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
             config.attrs = attribute;
             config.numAttrs = 1;
 
-            auto topk_weights_ptr = topk_weights.data_ptr<float>();
+            auto topk_weights_ptr = topk_weights.data_ptr<__nv_bfloat16>();
             auto topk_indices_ptr = topk_indices.data_ptr<int16_t>();
-            auto gate_scale_ptr = gate_scale.data_ptr<float>();
+            auto gate_scale_ptr = gate_scale.data_ptr<__nv_bfloat16>();
             auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();

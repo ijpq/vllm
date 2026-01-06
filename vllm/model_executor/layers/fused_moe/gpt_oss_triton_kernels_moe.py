@@ -92,17 +92,17 @@ def fused_routing(
     device = router_logits.device
     dtype = router_logits.dtype
 
-    topk_weights = torch.empty((M, topk), device=device, dtype=torch.float)
-    topk_indices = torch.empty((M, topk), device=device, dtype=torch.int)
+    topk_weights = torch.empty((M, topk), device=device, dtype=torch.float) # topk_softmax_kernel hard code it to be float. dtype of router_logits in routing
+    topk_indices = torch.empty((M, topk), device=device, dtype=torch.int) # can be int,uint,long, but int16 in routing
     token_expert_indices = torch.empty(
         M, topk, dtype=torch.int32, device=router_logits.device
-    )
+    ) # hard code to int
 
     hist = torch.zeros(N, device=device, dtype=torch.int32)
     expt_offs = torch.empty(N + 1, device=device, dtype=torch.int32)
 
     n_gates = M * topk
-    gate_scale = torch.empty(n_gates, device=device, dtype=torch.float)
+    gate_scale = torch.empty(n_gates, device=device, dtype=dtype) # dtype of router_logits in routing
     topk_index = torch.empty(n_gates, device=device, dtype=torch.int32)
     gate_index = torch.empty(n_gates, device=device, dtype=torch.int32)
 
@@ -141,10 +141,13 @@ def fused_routing(
         topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
     )
 
+    # Convert to expected dtypes for CUDA kernel
+    topk_weights.to(dtype)  # bfloat16
+    topk_indices.to(torch.int16)
     ops.fused_routing(
         router_logits,
-        topk_weights.to(torch.float),
-        topk_indices.to(torch.int16),
+        topk_weights,
+        topk_indices,
         max_n_tiles,
         topk,
         gate_scale,
@@ -154,9 +157,6 @@ def fused_routing(
         block_pid_map,
         expt_offs
     )
-
-    gate_scale = gate_scale.to(torch.bfloat16)
-    topk_weights = topk_weights.to(torch.bfloat16)
 
     token_offs_pad_dict = {
         (1 << (BLOCK_M_LOG2_START + i)): token_offs_pad[i]
