@@ -13,7 +13,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk_indices, int max_n_tiles, int topk,"
       " Tensor! gate_scale, Tensor! topk_index,"
       "Tensor! gate_index, Tensor! token_offs_pad, Tensor! block_pid_map, "
-      "Tensor! expt_offs) -> ()");
+      "Tensor! expt_offs, Tensor! hist) -> ()");
   m.impl("fused_routing", torch::kCUDA, &fused_routing);
 
   // Calculate the result of moe by summing up the partial results

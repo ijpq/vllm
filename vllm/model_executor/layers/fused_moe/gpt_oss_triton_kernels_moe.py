@@ -142,8 +142,8 @@ def fused_routing(
     )
 
     # Convert to expected dtypes for CUDA kernel
-    topk_weights.to(dtype)  # bfloat16
-    topk_indices.to(torch.int16)
+    topk_weights = topk_weights.to(dtype)  # bfloat16
+    topk_indices = topk_indices.to(torch.int16)
     ops.fused_routing(
         router_logits,
         topk_weights,
@@ -155,7 +155,8 @@ def fused_routing(
         gate_index,
         token_offs_pad,
         block_pid_map,
-        expt_offs
+        expt_offs,
+        hist
     )
 
     token_offs_pad_dict = {

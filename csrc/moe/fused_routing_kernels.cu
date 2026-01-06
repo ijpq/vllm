@@ -20,15 +20,13 @@ namespace moe {
 
 // IndexType <- int16*
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
-__global__ void fused_routing_kernel(__nv_bfloat16* __restrict__ topk_weights,
-                                     int16_t* __restrict__ topk_indices,
-                                     int64_t max_n_tiles, int64_t NUM_TOKENS,
-                                     __nv_bfloat16* __restrict__ gate_scale,
-                                     int32_t* __restrict__ topk_index,
-                                     int32_t* __restrict__ gate_index,
-                                     int32_t* __restrict__ token_offs_pad_ptr,
-                                     int32_t* __restrict__ block_pid_map_ptr,
-                                     int32_t* __restrict__ expt_offs_ptr);
+__global__ void fused_routing_kernel(
+    __nv_bfloat16* __restrict__ topk_weights,
+    int16_t* __restrict__ topk_indices, int64_t max_n_tiles, int64_t NUM_TOKENS,
+    __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
+    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
+    int32_t* __restrict__ block_pid_map_ptr,
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr);
 
 // template<>
 // __global__
@@ -43,12 +41,12 @@ __global__ void fused_routing_kernel(__nv_bfloat16* __restrict__ topk_weights,
 
 template <>
 __global__ void fused_routing_kernel<32, 4, 4>(
-    __nv_bfloat16* __restrict__ topk_weights, int16_t* __restrict__ topk_indices,
-    int64_t max_n_tiles, int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
-    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
-    int32_t* __restrict__ token_offs_pad_ptr,
+    __nv_bfloat16* __restrict__ topk_weights,
+    int16_t* __restrict__ topk_indices, int64_t max_n_tiles, int64_t NUM_TOKENS,
+    __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
+    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
-    int32_t* __restrict__ expt_offs_ptr) {
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
 
@@ -112,10 +110,14 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     __syncthreads();
     int32_t* global_hist = cluster.map_shared_rank(
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset), 0);
-#pragma unroll
-    for (int i = threadIdx.x; i < NUM_EXPERTS; i += blockDim.x) {
-        atomicAdd(global_hist + i, local_hist[i]);
+    // #pragma unroll
+    // for (int i = threadIdx.x; i < NUM_EXPERTS; i += blockDim.x) {
+    if (local_tid < 32) {
+        atomicAdd(global_hist + local_tid, local_hist[local_tid]);
+        printf("tid: %d, CTA: %d", local_tid, blockIdx.x);
     }
+
+    // }
     cluster.sync();
 
     /* phase 2*/
@@ -229,8 +231,11 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     if (blockIdx.x == 0 && local_tid < 32) {
         int32_t* hist_sum = reinterpret_cast<int32_t*>(
             sm_hist + global_hist_exclusivesum_offset);
+        int32_t* global_hist_sm =
+            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
         if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
+        hist_ptr[local_tid] = global_hist_sm[local_tid];
     }
 
     /* phase 3*/
@@ -270,7 +275,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                    int64_t topk, torch::Tensor& gate_scale,
                    torch::Tensor& topk_index, torch::Tensor& gate_index,
                    torch::Tensor& token_offs_pad, torch::Tensor& block_pid_map,
-                   torch::Tensor& expt_offs) {
+                   torch::Tensor& expt_offs, torch::Tensor& hist) {
     TORCH_CHECK(topk == 4, "");
     constexpr int const_topk = 4;
     constexpr int NUM_BLOCK_SIZES = 4;
@@ -297,8 +302,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                 sizeof(int32_t);
 
             config.blockDim = dim3(512, 1, 1);
-            LOG(INFO) << "Req Smem: " << config.dynamicSmemBytes << " bytes"
-                      ;
+            LOG(INFO) << "Req Smem: " << config.dynamicSmemBytes << " bytes";
             cudaFuncSetAttribute(kernel_wrapper,
                                  cudaFuncAttributeNonPortableClusterSizeAllowed,
                                  1);
@@ -312,7 +316,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
             // should be a multiple of cluster size.
             assert(cluster_size != 0 && "unexpected 0");
             auto grid_dim = dim3(cluster_size, 1, 1);
-            int threads_per_block = (num_tokens + grid_dim.x - 1) / grid_dim.x;
+            int threads_per_block =  std::max<int>(32,(num_tokens + grid_dim.x - 1) / grid_dim.x);
             assert(threads_per_block <= 1024 &&
                    "if so fallback to triton_kernels");
             auto block_dim = dim3(threads_per_block, 1, 1);
@@ -328,20 +332,23 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
             config.attrs = attribute;
             config.numAttrs = 1;
 
-            auto topk_weights_ptr = topk_weights.data_ptr<__nv_bfloat16>();
+            auto topk_weights_ptr =
+                reinterpret_cast<__nv_bfloat16*>(topk_weights.data_ptr());
+            auto gate_scale_ptr =
+                reinterpret_cast<__nv_bfloat16*>(gate_scale.data_ptr());
             auto topk_indices_ptr = topk_indices.data_ptr<int16_t>();
-            auto gate_scale_ptr = gate_scale.data_ptr<__nv_bfloat16>();
             auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
             auto block_pid_map_ptr = block_pid_map.data_ptr<int32_t>();
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
+            auto hist_ptr = hist.data_ptr<int32_t>();
 
             cudaLaunchKernelEx(&config, kernel_wrapper, topk_weights_ptr,
                                topk_indices_ptr, max_n_tiles, num_tokens,
                                gate_scale_ptr, topk_index_ptr, gate_index_ptr,
                                token_offs_pad_ptr, block_pid_map_ptr,
-                               expt_offs_ptr);
+                               expt_offs_ptr, hist_ptr);
             break;
         }
         case 128: {
