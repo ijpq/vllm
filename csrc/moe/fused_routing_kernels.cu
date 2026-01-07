@@ -21,8 +21,8 @@ namespace moe {
 // IndexType <- int16*
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
 __global__ void fused_routing_kernel(
-    __nv_bfloat16* __restrict__ topk_weights,
-    int16_t* __restrict__ topk_indices, int64_t max_n_tiles, int64_t NUM_TOKENS,
+    const __nv_bfloat16* __restrict__ topk_weights,
+    const int16_t* __restrict__ topk_indices, const int64_t max_n_tiles, const int64_t NUM_TOKENS,
     __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
@@ -48,7 +48,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
-    static_assert(alignof(topk_indices) == 128);
+    // static_assert(alignof(topk_indices) == 128);
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
 
@@ -56,9 +56,9 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     int tid = local_tid + blockDim.x * blockIdx.x;
     int CTA_ID = blockIdx.x;
     int num_threads = blockDim.x * gridDim.x;
-    // const int NUM_EXPERTS = 32;
-    // const int topk = 4;
-    // constexpr int NUM_BLOCK_SIZES = 4;
+    const int NUM_EXPERTS = 32;
+    const int topk = 4;
+    constexpr int NUM_BLOCK_SIZES = 4;
     int ROWS_PER_THREADS = (NUM_TOKENS + num_threads - 1) / num_threads;
     int ROWS_PER_CTA = (NUM_TOKENS + gridDim.x - 1) / gridDim.x;
 
@@ -105,7 +105,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
          i += row_stride) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
         int64_t row_experts =
-            *reinterpret_cast<int64_t*>(topk_indices + tid * topk);
+            *reinterpret_cast<int64_t*>(const_cast<int16_t*>(topk_indices) + i * topk);
         auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
         auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
         auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
@@ -277,7 +277,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
 }  // namespace vllm
 
 template <typename ValType>
-void routing_kernel_helper(torch::Tensor& topk_weights,
+void routing_kernel_helper(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                            torch::Tensor& topk_indices, int64_t max_n_tiles,
                            int64_t topk,
 
@@ -375,7 +375,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
     */
     if (topk_indices.scalar_type() == at::ScalarType::BFloat16 &&
         gate_scale.scalar_type() == at::ScalarType::BFloat16) {
-        routing_kernel_helper<__nv_bfloat16>(
+        routing_kernel_helper<__nv_bfloat16>(gating_output,
             topk_weights, topk_indices, max_n_tiles, topk, gate_scale,
             topk_index, gate_index, token_offs_pad, block_pid_map, expt_offs,
             hist);
