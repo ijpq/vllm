@@ -18,7 +18,7 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-// IndexType <- int16*
+#define FUSED_ROUTING_CEIL_DIV(x,y) (x + ((y)-1)) / (y)
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
 __global__ void fused_routing_kernel(
     __nv_bfloat16* __restrict__ topk_weights,
@@ -60,8 +60,12 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     const int NUM_EXPERTS = 32;
     const int topk = 4;
     constexpr int NUM_BLOCK_SIZES = 4;
-    int ROWS_PER_THREADS = (NUM_TOKENS + num_threads - 1) / num_threads;
-    int ROWS_PER_CTA = (NUM_TOKENS + gridDim.x - 1) / gridDim.x;
+    // int ROWS_PER_THREADS = (NUM_TOKENS + num_threads - 1) / num_threads;
+    int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
+    // int ROWS_PER_CTA = (NUM_TOKENS + gridDim.x - 1) / gridDim.x;
+    int ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, gridDim.x);
+    // int HYPO_ROWS_PER_CTA = (NUM_TOKENS + )
+    int HYPO_ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, 8); 
 
     // shared memory layout
     /*
@@ -87,7 +91,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     int expert_across_offset =
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
-    int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
+    int shared_mem_size = local_offset_offset + topk * HYPO_ROWS_PER_CTA;
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
         sm_hist[i] = 0;
@@ -116,10 +120,10 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
         auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
         int local_i = i - row;
-        local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
-        local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
-        local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
-        local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
+        // local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
+        // local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
+        // local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
+        // local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
     }
     __syncthreads();
     int32_t* global_hist = cluster.map_shared_rank(
@@ -269,7 +273,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             int flat_idx = i * topk + k;
             int expert_base = hist_sum[expert_id];
             int expert_prior = prior_contrib[expert_id];
-            int expert_local = local_offset_sm[local_i * topk + k];
+            // int expert_local = local_offset_sm[local_i * topk + k];
+            int expert_local = 0;
             int global_pos = expert_base + expert_prior + expert_local;
 
             gate_scale[global_pos] = val;
@@ -282,7 +287,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
 }  // namespace moe
 }  // namespace vllm
 
-template <typename ValType>
+template <typename IdxType, typename ValType>
 void routing_kernel_helper(torch::Tensor& gating_output,
                            torch::Tensor& topk_weights,
                            torch::Tensor& topk_indices, int64_t max_n_tiles,
@@ -360,7 +365,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 reinterpret_cast<ValType*>(topk_weights.data_ptr());
             auto gate_scale_ptr =
                 reinterpret_cast<ValType*>(gate_scale.data_ptr());
-            auto topk_indices_ptr = topk_indices.data_ptr<int16_t>();
+            auto topk_indices_ptr = topk_indices.data_ptr<IdxType>();
             auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
@@ -390,8 +395,9 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
     dispatch dtype
     */
     if (topk_indices.scalar_type() == at::ScalarType::Short &&
-        gate_scale.scalar_type() == at::ScalarType::BFloat16) {
-        routing_kernel_helper<__nv_bfloat16>(
+        gate_scale.scalar_type() == at::ScalarType::BFloat16 &&
+        topk_weights.scalar_type() == at::ScalarType::BFloat16) {
+        routing_kernel_helper<int16_t,__nv_bfloat16>(
             gating_output, topk_weights, topk_indices, max_n_tiles, topk,
             gate_scale, topk_index, gate_index, token_offs_pad, block_pid_map,
             expt_offs, hist);
