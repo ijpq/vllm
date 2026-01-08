@@ -92,11 +92,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
-#pragma unroll
-    for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
-        sm_hist[i] = 0;
-    }
-    cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
     /*phase 1*/
     int32_t* local_hist =
@@ -113,21 +108,17 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         // int64_t row_experts =
         //     *reinterpret_cast<int64_t*>(const_cast<int16_t*>(topk_indices) +
         //     i * topk);
-        // int64_t row_experts =
-        //     *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
-        // auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
-        // auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
-        // auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
-        // auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
-        auto expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
-        auto expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
-        auto expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
-        auto expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
+        int64_t row_experts =
+            *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
+        auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
+        auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
+        auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
+        auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
         int local_i = i - row;
-        local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
-        local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
-        local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
-        local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
+        // local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
+        // local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
+        // local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
+        // local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
     }
     __syncthreads();
     int32_t* global_hist = cluster.map_shared_rank(
@@ -176,7 +167,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         }
 
         // compute global hist exclusive sum
-        // we get exclusive sum  [0, 100,120, 170]
 
         // align the data with triton's matmul_ogs
         int BLOCK_M_LOG2_START = 4;
@@ -188,14 +178,13 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             size * max_n_tiles;
 
         int n_tiles =
-            (h + block_m - 1) / block_m;  // group num_tokens into tiles, [7, 1,
-                                          // 8] when block_m = 16
+            (h + block_m - 1) / block_m;  
+                                          
         int warp_reduce = 0;
         int exclusive_res = 0;
         WarpScan(temp_storage[warp_id])
             .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
         __syncwarp();
-        // we get exclusive sum  [0, 7, 8, 16]
 
         // compute tiles exclusive sum
         int32_t* token_offs_pad =
@@ -205,33 +194,17 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             token_offs_pad[size * (NUM_EXPERTS + 1) + 32] = warp_reduce;
 
         int tile_start = token_offs_pad[size * (NUM_EXPERTS + 1) + lane_id];
-        /*
-        tid0: h = 100, n_tiles = 7; tid1: h=20, n_tiles= 1; tid2: h = 50,
-        n_tiles=8;
-
-        tid0:
-        0<<16 | 0;
-        1<<16 | 0;
-        ...
-        6<<16 | 0;
-
-        tid1:
-        0<<16 | 1;
-
-        tid2:
-        0<<16 | 2;
-        1<<16 | 2;
-        ...
-        7<<16 | 2;
-        */
         for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
+            if (tile_start + block_idx < max_n_tiles) {
             int packed_val = (block_idx << 16) | lane_id;
             pid_map_row[(tile_start + block_idx)] = packed_val;
+
+            }
         }
     }
     cluster.sync();
 
-    // WB global memory(pidmap, tokenoffspad, global hist sum)
+    // WB global memory
     int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
     int pid_map_size = NUM_BLOCK_SIZES * (max_n_tiles);
 
@@ -273,7 +246,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             int flat_idx = i * topk + k;
             int expert_base = hist_sum[expert_id];
             int expert_prior = prior_contrib[expert_id];
-            int expert_local = local_offset_sm[local_i * topk + k];
+            // int expert_local = local_offset_sm[local_i * topk + k];
+            int expert_local = 0;
             int global_pos = expert_base + expert_prior + expert_local;
 
             gate_scale[global_pos] = val;
@@ -309,7 +283,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     switch (num_experts) {
         case 32: {
             auto warp_size = 32;
-            int cluster_size = 0;
+            int cluster_size = 8;
             int THREAD_PER_CTA = 512;
             cudaLaunchConfig_t config = {};
             auto kernel_wrapper =
@@ -332,14 +306,6 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                  token_offs_pad_size + block_pid_size + prefix_experts_size +
                  local_offset_size) *
                 sizeof(int32_t);
-            // config.dynamicSmemBytes = 200*1024;  // Minimal for query
-            cudaFuncSetAttribute(kernel_wrapper,
-                                 cudaFuncAttributeNonPortableClusterSizeAllowed,
-                                 1);
-            cudaError_t err = cudaOccupancyMaxPotentialClusterSize(
-                &cluster_size, kernel_wrapper, &config);
-            std::cout << "cudaOccupancyMaxPotentialClusterSize returned: "
-                      << cudaGetErrorString(err) << std::endl;
             std::cout << "cluster size: " << cluster_size << std::endl;
 
             // Now calculate shared memory with actual cluster_size

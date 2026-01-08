@@ -21,7 +21,7 @@ try:
     torch.manual_seed(42)
     router_logits = torch.randn((32, 32), dtype=torch.bfloat16, device='cuda')
     result = fused_routing(router_logits, 4, renormalize=True)
+    torch.cuda.synchronize()
     print("fused_routing: OK")
 except Exception as e:
     print(f"fused_routing FAILED: {e}")
-torch.cuda.synchronize()
