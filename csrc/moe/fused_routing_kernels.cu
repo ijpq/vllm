@@ -60,11 +60,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     const int NUM_EXPERTS = 32;
     const int topk = 4;
     constexpr int NUM_BLOCK_SIZES = 4;
-    // int ROWS_PER_THREADS = (NUM_TOKENS + num_threads - 1) / num_threads;
     int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
-    // int ROWS_PER_CTA = (NUM_TOKENS + gridDim.x - 1) / gridDim.x;
     int ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, gridDim.x);
-    // int HYPO_ROWS_PER_CTA = (NUM_TOKENS + )
     int HYPO_ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, 8);
 
     // shared memory layout
@@ -92,6 +89,11 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
+#pragma unroll
+    for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
+        sm_hist[i] = 0;
+    }
+    cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
     /*phase 1*/
     int32_t* local_hist =
@@ -105,9 +107,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     for (int i = row + local_tid; i < row_end;
          i += blockDim.x) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
-        // int64_t row_experts =
-        //     *reinterpret_cast<int64_t*>(const_cast<int16_t*>(topk_indices) +
-        //     i * topk);
         int64_t row_experts =
             *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
         auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
@@ -119,8 +118,12 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         // local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
         // local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
         // local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
+        atomicAdd(local_hist + expt0, 1);
+        atomicAdd(local_hist + expt1, 1);
+        atomicAdd(local_hist + expt2, 1);
+        atomicAdd(local_hist + expt3, 1);
     }
-    __syncthreads();
+    __syncthreads();  // to ensure local_hist in SM finish.
     int32_t* global_hist = cluster.map_shared_rank(
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset), 0);
     if (local_tid < NUM_EXPERTS) {
@@ -177,9 +180,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
             size * max_n_tiles;
 
-        int n_tiles =
-            (h + block_m - 1) / block_m;  
-                                          
+        int n_tiles = (h + block_m - 1) / block_m;
+
         int warp_reduce = 0;
         int exclusive_res = 0;
         WarpScan(temp_storage[warp_id])
@@ -195,11 +197,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
 
         int tile_start = token_offs_pad[size * (NUM_EXPERTS + 1) + lane_id];
         for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
-            if (tile_start + block_idx < max_n_tiles) {
             int packed_val = (block_idx << 16) | lane_id;
             pid_map_row[(tile_start + block_idx)] = packed_val;
-
-            }
         }
     }
     cluster.sync();
@@ -224,31 +223,50 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         int32_t* global_hist_sm =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
-        if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
         hist_ptr[local_tid] = global_hist_sm[local_tid];
+        if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
     cluster.sync();
 
     /* phase 3*/
 
-    int32_t* hist_sum = cluster.map_shared_rank(
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
-        0);
     int32_t* prior_contrib =
         reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
+
+    /*
+    WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
+    cudaErrorLaunchFailure.
+    */
+    int32_t* hist_sum_sm0 = cluster.map_shared_rank(
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
+        0);
+    int32_t* hist_sum_local =
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
+    if (local_tid < NUM_EXPERTS)
+        hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
+
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
         for (int k = 0; k < topk; k++) {
             int expert_id = topk_indices[i * topk_idx_stride + k];
+            if (expert_id >= NUM_EXPERTS) printf("expt id: %d\n", expert_id);
             __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
             int flat_idx = i * topk + k;
-            int expert_base = hist_sum[expert_id];
+            int expert_base = hist_sum_local[expert_id];
+            // int expert_base = 0;
             int expert_prior = prior_contrib[expert_id];
             // int expert_local = local_offset_sm[local_i * topk + k];
             int expert_local = 0;
             int global_pos = expert_base + expert_prior + expert_local;
+            if (global_pos >= NUM_TOKENS * topk)
+                printf(
+                    "out of bound : %d, expert_base: %d, expert_prior: %d, "
+                    "expert_local: %d",
+                    global_pos, expert_base, expert_prior, expert_local);
+            if (flat_idx >= NUM_TOKENS * topk)
+                printf("out of bound : %d, i: %d", flat_idx, i);
 
             gate_scale[global_pos] = val;
             topk_index[global_pos] = flat_idx;
@@ -283,7 +301,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     switch (num_experts) {
         case 32: {
             auto warp_size = 32;
-            int cluster_size = 8;
+            int cluster_size = 0;
             int THREAD_PER_CTA = 512;
             cudaLaunchConfig_t config = {};
             auto kernel_wrapper =
@@ -306,24 +324,30 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                  token_offs_pad_size + block_pid_size + prefix_experts_size +
                  local_offset_size) *
                 sizeof(int32_t);
+            cudaFuncSetAttribute(kernel_wrapper,
+                                 cudaFuncAttributeNonPortableClusterSizeAllowed,
+                                 1);
+            cudaError_t err = cudaOccupancyMaxPotentialClusterSize(
+                &cluster_size, kernel_wrapper, &config);
+
+            std::cout << "cudaOccupancyMaxPotentialClusterSize returned: "
+                      << cudaGetErrorString(err) << std::endl;
             std::cout << "cluster size: " << cluster_size << std::endl;
-
-            // Now calculate shared memory with actual cluster_size
-            // Use ceiling division to match kernel's ROWS_PER_CTA calculation
-
             std::cout << "Req Smem: " << config.dynamicSmemBytes << " bytes"
                       << std::endl;
+
             auto grid_dim = dim3(cluster_size, 1, 1);
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
+
             // recompute SM
             rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
             local_offset_size = topk * rows_per_cta;  // Use actual rows_per_cta
-            // config.dynamicSmemBytes =
-            //     (global_hist_size + local_hist_size + global_hist_prefix_size +
-            //      token_offs_pad_size + block_pid_size + prefix_experts_size +
-            //      local_offset_size) *
-            //     sizeof(int32_t);
+            config.dynamicSmemBytes =
+                (global_hist_size + local_hist_size + global_hist_prefix_size +
+                 token_offs_pad_size + block_pid_size + prefix_experts_size +
+                 local_offset_size) *
+                sizeof(int32_t);
 
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeClusterDimension;
