@@ -114,14 +114,14 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
         auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
         int local_i = i - row;
-        // local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
-        // local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
-        // local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
-        // local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
-        atomicAdd(local_hist + expt0, 1);
-        atomicAdd(local_hist + expt1, 1);
-        atomicAdd(local_hist + expt2, 1);
-        atomicAdd(local_hist + expt3, 1);
+        local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
+        local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
+        local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
+        local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
+        // atomicAdd(local_hist + expt0, 1);
+        // atomicAdd(local_hist + expt1, 1);
+        // atomicAdd(local_hist + expt2, 1);
+        // atomicAdd(local_hist + expt3, 1);
     }
     __syncthreads();  // to ensure local_hist in SM finish.
     int32_t* global_hist = cluster.map_shared_rank(
@@ -254,11 +254,12 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             if (expert_id >= NUM_EXPERTS) printf("expt id: %d\n", expert_id);
             __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
             int flat_idx = i * topk + k;
-            int expert_base = hist_sum_sm0[expert_id];
+            int expert_base = hist_sum_local[expert_id];
             // int expert_base = 0;
             int expert_prior = prior_contrib[expert_id];
-            // int expert_local = local_offset_sm[local_i * topk + k];
-            int expert_local = 0;
+            printf("local offset idx: %d\n", local_i * topk +k);
+            int expert_local = local_offset_sm[local_i * topk + k];
+            // int expert_local = 0;
             int global_pos = expert_base + expert_prior + expert_local;
             if (global_pos >= NUM_TOKENS * topk)
                 printf(
