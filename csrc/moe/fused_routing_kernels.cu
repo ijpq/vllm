@@ -21,10 +21,11 @@ namespace moe {
 // IndexType <- int16*
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
 __global__ void fused_routing_kernel(
-    const __nv_bfloat16* __restrict__ topk_weights,
-    const int16_t* __restrict__ topk_indices, const int64_t max_n_tiles, const int64_t NUM_TOKENS,
-    __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
-    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
+    __nv_bfloat16* __restrict__ topk_weights,
+    int16_t* __restrict__ topk_indices, const int64_t max_n_tiles,
+    const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
+    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
+    int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr);
 
@@ -41,8 +42,8 @@ __global__ void fused_routing_kernel(
 
 template <>
 __global__ void fused_routing_kernel<32, 4, 4>(
-    const __nv_bfloat16* __restrict__ topk_weights,
-    const int16_t* __restrict__ topk_indices, const int64_t max_n_tiles,
+    __nv_bfloat16* __restrict__ topk_weights,
+    int16_t* __restrict__ topk_indices, const int64_t max_n_tiles,
     const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
     int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
@@ -99,19 +100,23 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     int32_t* local_offset_sm =
         reinterpret_cast<int32_t*>(sm_hist + local_offset_offset);
     int row = CTA_ID * ROWS_PER_CTA;
-    int row_end = min((int64_t)(row + ROWS_PER_CTA), NUM_TOKENS);  // Each CTA only processes its own rows
+    int row_end = min((int64_t)(row + ROWS_PER_CTA),
+                      NUM_TOKENS);  // Each CTA only processes its own rows
 #pragma unroll
     for (int i = row + local_tid; i < row_end;
          i += blockDim.x) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
+        // int64_t row_experts =
+        //     *reinterpret_cast<int64_t*>(const_cast<int16_t*>(topk_indices) +
+        //     i * topk);
         int64_t row_experts =
-            *reinterpret_cast<int64_t*>(const_cast<int16_t*>(topk_indices) + i * topk);
+            *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
         auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
         auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
         auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
         auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
         int local_i = i - row;
-        local_offset_sm[local_i * topk ] = atomicAdd(local_hist + expt0, 1);
+        local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
         local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
         local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
         local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
@@ -278,7 +283,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
 }  // namespace vllm
 
 template <typename ValType>
-void routing_kernel_helper(torch::Tensor& gating_output, torch::Tensor& topk_weights,
+void routing_kernel_helper(torch::Tensor& gating_output,
+                           torch::Tensor& topk_weights,
                            torch::Tensor& topk_indices, int64_t max_n_tiles,
                            int64_t topk,
 
@@ -295,7 +301,7 @@ void routing_kernel_helper(torch::Tensor& gating_output, torch::Tensor& topk_wei
     constexpr int NUM_BLOCK_SIZES = 4;
     const auto num_experts = gating_output.size(-1);
     const auto num_tokens = gating_output.numel() / num_experts;
-    
+
     switch (num_experts) {
         case 32: {
             auto warp_size = 32;
@@ -306,8 +312,23 @@ void routing_kernel_helper(torch::Tensor& gating_output, torch::Tensor& topk_wei
                 &(vllm::moe::fused_routing_kernel<32, const_topk,
                                                   NUM_BLOCK_SIZES>);
 
-            // First, get the actual cluster size with minimal shared memory
-            config.dynamicSmemBytes = 200*1024;  // Minimal for query
+            int hypo_cluster_size = 8;
+            size_t rows_per_cta =
+                (num_tokens + hypo_cluster_size - 1) / hypo_cluster_size;
+            size_t global_hist_size = num_experts;
+            size_t local_hist_size = num_experts;
+            size_t global_hist_prefix_size = num_experts + 1;
+            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
+            size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
+            size_t prefix_experts_size = num_experts;
+            size_t local_offset_size =
+                topk * rows_per_cta;  // Use actual rows_per_cta
+            config.dynamicSmemBytes =
+                (global_hist_size + local_hist_size + global_hist_prefix_size +
+                 token_offs_pad_size + block_pid_size + prefix_experts_size +
+                 local_offset_size) *
+                sizeof(int32_t);
+            // config.dynamicSmemBytes = 200*1024;  // Minimal for query
             cudaFuncSetAttribute(kernel_wrapper,
                                  cudaFuncAttributeNonPortableClusterSizeAllowed,
                                  1);
@@ -319,21 +340,9 @@ void routing_kernel_helper(torch::Tensor& gating_output, torch::Tensor& topk_wei
 
             // Now calculate shared memory with actual cluster_size
             // Use ceiling division to match kernel's ROWS_PER_CTA calculation
-            size_t rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-            size_t global_hist_size = num_experts;
-            size_t local_hist_size = num_experts;
-            size_t global_hist_prefix_size = num_experts + 1;
-            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
-            size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
-            size_t prefix_experts_size = num_experts;
-            size_t local_offset_size = topk * rows_per_cta;  // Use actual rows_per_cta
-            config.dynamicSmemBytes =
-                (global_hist_size + local_hist_size + global_hist_prefix_size +
-                 token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size) *
-                sizeof(int32_t);
 
-            std::cout << "Req Smem: " << config.dynamicSmemBytes << " bytes" << std::endl;
+            std::cout << "Req Smem: " << config.dynamicSmemBytes << " bytes"
+                      << std::endl;
             auto grid_dim = dim3(cluster_size, 1, 1);
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
@@ -364,19 +373,10 @@ void routing_kernel_helper(torch::Tensor& gating_output, torch::Tensor& topk_wei
                                gate_scale_ptr, topk_index_ptr, gate_index_ptr,
                                token_offs_pad_ptr, block_pid_map_ptr,
                                expt_offs_ptr, hist_ptr);
-            
-            // Synchronize and check for errors
-            cudaError_t launch_err = cudaGetLastError();
-            if (launch_err != cudaSuccess) {
-                TORCH_CHECK(false, "CUDA kernel launch error: ", cudaGetErrorString(launch_err));
-            }
-            cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                TORCH_CHECK(false, "CUDA kernel sync error: ", cudaGetErrorString(sync_err));
-            }
+
             break;
         }
-        TORCH_CHECK(false, "Unsupported num experts: ", num_experts);
+            TORCH_CHECK(false, "Unsupported num experts: ", num_experts);
     }
 }
 
@@ -391,10 +391,10 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
     */
     if (topk_indices.scalar_type() == at::ScalarType::Short &&
         gate_scale.scalar_type() == at::ScalarType::BFloat16) {
-        routing_kernel_helper<__nv_bfloat16>(gating_output,
-            topk_weights, topk_indices, max_n_tiles, topk, gate_scale,
-            topk_index, gate_index, token_offs_pad, block_pid_map, expt_offs,
-            hist);
+        routing_kernel_helper<__nv_bfloat16>(
+            gating_output, topk_weights, topk_indices, max_n_tiles, topk,
+            gate_scale, topk_index, gate_index, token_offs_pad, block_pid_map,
+            expt_offs, hist);
     } else {
         TORCH_CHECK(false, "Unsupported dtype: ", topk_indices.scalar_type(),
                     gate_scale.scalar_type());

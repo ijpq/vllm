@@ -21,7 +21,7 @@ print("\nTesting fused_routing...")
 try:
     from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import fused_routing
     torch.manual_seed(42)
-    router_logits = torch.randn((16, 32), dtype=torch.bfloat16, device='cuda')
+    router_logits = torch.randn((32, 32), dtype=torch.bfloat16, device='cuda')
     result = fused_routing(router_logits, 4, renormalize=True)
     print("fused_routing: OK")
 except Exception as e:
@@ -31,7 +31,7 @@ except Exception as e:
 print("\nTesting triton_routing AFTER fused_routing...")
 try:
     torch.manual_seed(42)
-    router_logits = torch.randn((16, 32), dtype=torch.bfloat16, device='cuda')
+    router_logits = torch.randn((32, 32), dtype=torch.bfloat16, device='cuda')
     result = triton_routing(router_logits, 4, sm_first=False)
     print("triton_routing after fused: OK")
 except Exception as e:
