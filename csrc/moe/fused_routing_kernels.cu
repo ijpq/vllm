@@ -254,7 +254,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             if (expert_id >= NUM_EXPERTS) printf("expt id: %d\n", expert_id);
             __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
             int flat_idx = i * topk + k;
-            int expert_base = hist_sum_local[expert_id];
+            int expert_base = hist_sum_sm0[expert_id];
             // int expert_base = 0;
             int expert_prior = prior_contrib[expert_id];
             // int expert_local = local_offset_sm[local_i * topk + k];
