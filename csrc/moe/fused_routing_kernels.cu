@@ -319,11 +319,11 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             // recompute SM
             rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
             local_offset_size = topk * rows_per_cta;  // Use actual rows_per_cta
-            config.dynamicSmemBytes =
-                (global_hist_size + local_hist_size + global_hist_prefix_size +
-                 token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size) *
-                sizeof(int32_t);
+            // config.dynamicSmemBytes =
+            //     (global_hist_size + local_hist_size + global_hist_prefix_size +
+            //      token_offs_pad_size + block_pid_size + prefix_experts_size +
+            //      local_offset_size) *
+            //     sizeof(int32_t);
 
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeClusterDimension;
