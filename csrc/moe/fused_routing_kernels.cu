@@ -89,9 +89,14 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
+    int block_pid_start = block_pid_offset;
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
         sm_hist[i] = 0;
+    }
+    for (int i = local_tid; i < NUM_BLOCK_SIZES * (max_n_tiles);
+         i += blockDim.x) {
+        sm_hist[i + block_pid_start] = -1;
     }
     cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
@@ -118,10 +123,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
         local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
         local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
-        // atomicAdd(local_hist + expt0, 1);
-        // atomicAdd(local_hist + expt1, 1);
-        // atomicAdd(local_hist + expt2, 1);
-        // atomicAdd(local_hist + expt3, 1);
     }
     __syncthreads();  // to ensure local_hist in SM finish.
     int32_t* global_hist = cluster.map_shared_rank(
@@ -154,9 +155,8 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     }
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
         int lane_id = threadIdx.x % 32;
-        int h =
-            global_hist[lane_id];  // how many tokens are routed to this
-                                   // expert, globally. let's say [100,20,50]
+        int h = global_hist[lane_id];
+        // compute global hist prefixsum
         if (local_tid < NUM_EXPERTS) {
             int exclusive_res = 0;
             int warp_reduce = 0;
@@ -169,8 +169,6 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             if (local_tid == 0) hist_sum[NUM_EXPERTS] = warp_reduce;
         }
 
-        // compute global hist exclusive sum
-
         // align the data with triton's matmul_ogs
         int BLOCK_M_LOG2_START = 4;
         int size = warp_id;
@@ -179,21 +177,20 @@ __global__ void fused_routing_kernel<32, 4, 4>(
         int32_t* pid_map_row =
             reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
             size * max_n_tiles;
-
         int n_tiles = (h + block_m - 1) / block_m;
-
         int warp_reduce = 0;
         int exclusive_res = 0;
         WarpScan(temp_storage[warp_id])
             .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
-        __syncwarp();
+        __syncwarp();  // to ensure exlcusive sum finished within one warp
 
-        // compute tiles exclusive sum
         int32_t* token_offs_pad =
             reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
         token_offs_pad[size * (NUM_EXPERTS + 1) + lane_id] = exclusive_res;
         if (lane_id == 0)
-            token_offs_pad[size * (NUM_EXPERTS + 1) + 32] = warp_reduce;
+            token_offs_pad[size * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
+                warp_reduce;
+        // __syncwarp(); // since the last pos won't be read in this loop.
 
         int tile_start = token_offs_pad[size * (NUM_EXPERTS + 1) + lane_id];
         for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
@@ -255,19 +252,16 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
             int flat_idx = i * topk + k;
             int expert_base = hist_sum_local[expert_id];
-            // int expert_base = 0;
             int expert_prior = prior_contrib[expert_id];
-            printf("local offset idx: %d\n", local_i * topk +k);
             int expert_local = local_offset_sm[local_i * topk + k];
-            // int expert_local = 0;
             int global_pos = expert_base + expert_prior + expert_local;
-            if (global_pos >= NUM_TOKENS * topk)
-                printf(
-                    "out of bound : %d, expert_base: %d, expert_prior: %d, "
-                    "expert_local: %d",
-                    global_pos, expert_base, expert_prior, expert_local);
-            if (flat_idx >= NUM_TOKENS * topk)
-                printf("out of bound : %d, i: %d", flat_idx, i);
+            // if (global_pos >= NUM_TOKENS * topk)
+            //     printf(
+            //         "out of bound : %d, expert_base: %d, expert_prior: %d, "
+            //         "expert_local: %d",
+            //         global_pos, expert_base, expert_prior, expert_local);
+            // if (flat_idx >= NUM_TOKENS * topk)
+            //     printf("out of bound : %d, i: %d", flat_idx, i);
 
             gate_scale[global_pos] = val;
             topk_index[global_pos] = flat_idx;
@@ -334,8 +328,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             std::cout << "cudaOccupancyMaxPotentialClusterSize returned: "
                       << cudaGetErrorString(err) << std::endl;
             std::cout << "cluster size: " << cluster_size << std::endl;
-            std::cout << "Req Smem: " << config.dynamicSmemBytes << " bytes"
-                      << std::endl;
+            std::cout << "Req Smem: " << config.dynamicSmemBytes / 1024.f
+                      << " Kbytes" << std::endl;
+            if (cluster_size == 0) {
+                std::cout << "fallback to 8 cluster" << std::endl;
+                cluster_size = 8;
+            }
 
             auto grid_dim = dim3(cluster_size, 1, 1);
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
