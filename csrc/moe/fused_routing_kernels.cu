@@ -18,7 +18,7 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
 __global__ void fused_routing_kernel(
     __nv_bfloat16* __restrict__ topk_weights,
@@ -298,10 +298,6 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto warp_size = 32;
             int cluster_size = 0;
             int THREAD_PER_CTA = 512;
-            cudaLaunchConfig_t config = {};
-            auto kernel_wrapper =
-                &(vllm::moe::fused_routing_kernel<32, const_topk,
-                                                  NUM_BLOCK_SIZES>);
 
             int hypo_cluster_size = 8;
             size_t rows_per_cta =
@@ -314,44 +310,62 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size =
                 topk * rows_per_cta;  // Use actual rows_per_cta
-            config.dynamicSmemBytes =
-                (global_hist_size + local_hist_size + global_hist_prefix_size +
-                 token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size + 1024) *
-                sizeof(int32_t);
-            cudaError_t smem_err = cudaFuncSetAttribute(
-                kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                config.dynamicSmemBytes);
-            std::cout << "cudaFuncSetAttribute (MaxDynamicSharedMemorySize) "
-                         "returned: "
-                      << cudaGetErrorString(smem_err) << std::endl;
-            cudaError_t set_err = cudaFuncSetAttribute(
-                kernel_wrapper, cudaFuncAttributeNonPortableClusterSizeAllowed,
-                1);
-            std::cout << "cudaFuncSetAttribute returned: "
-                      << cudaGetErrorString(set_err) << std::endl;
 
             cudaFuncAttributes attr;
-            cudaError_t attr_err = cudaFuncGetAttributes(&attr, kernel_wrapper);
-            std::cout << "cudaFuncGetAttributes: "
-                      << cudaGetErrorString(attr_err) << std::endl;
+            // query static allocated sm size
+            auto cuda_error = cudaFuncGetAttributes(&attr, my_kernel_function);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
+            size_t static_smem_size = attr.sharedSizeBytes;
+            size_t required_dynamicSmemBytes =
+                (global_hist_size + local_hist_size + global_hist_prefix_size +
+                 token_offs_pad_size + block_pid_size + prefix_experts_size +
+                 local_offset_size) *
+                sizeof(int32_t);
+            size_t requried_sm_size = static_smem + required_dynamicSmemBytes;
+
+            // dev id
+            int dev_id = 0;
+            cuda_error = cudaGetDevice(&dev_id);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
+
+            // max sm size
+            int max_hw_limit = 0;
+            cuda_error = cudaDeviceGetAttribute(
+                &max_hw_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id);
+            TORCH_CHECK(requried_sm_size <= max_hw_limit,
+                        cudaGetErrorString(cuda_error));
+
+            cudaLaunchConfig_t config = {};
+            auto kernel_wrapper =
+                &(vllm::moe::fused_routing_kernel<32, const_topk,
+                                                  NUM_BLOCK_SIZES>);
+            cuda_error = cudaFuncSetAttribute(
+                kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                config.dynamicSmemBytes);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+
+            cuda_error = cudaFuncSetAttribute(
+                kernel_wrapper, cudaFuncAttributeNonPortableClusterSizeAllowed,
+                1);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+
+            cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
             std::cout << "  binaryVersion: " << attr.binaryVersion
                       << std::endl;  // 应该是 90 for sm_90
             std::cout << "  maxDynamicSharedSizeBytes: "
                       << attr.maxDynamicSharedSizeBytes << std::endl;
             std::cout << "  sharedSizeBytes: " << attr.sharedSizeBytes
                       << std::endl;
-            cudaError_t err = cudaOccupancyMaxPotentialClusterSize(
+            cuda_error = cudaOccupancyMaxPotentialClusterSize(
                 &cluster_size, kernel_wrapper, &config);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
 
-            std::cout << "cudaOccupancyMaxPotentialClusterSize returned: "
-                      << cudaGetErrorString(err) << std::endl;
             std::cout << "cluster size: " << cluster_size << std::endl;
             std::cout << "Req Smem: " << config.dynamicSmemBytes / 1024.f
                       << " Kbytes" << std::endl;
-            if (cluster_size == 0 || config.dynamicSmemBytes > attr.maxDynamicSharedSizeBytes) {
-                std::cout << "cluster size error or dynamicsmem error: cluster size" <<
-                cluster_size << "," << "req smem: " << config.dynamicSmemBytes << ", max" << attr.maxDynamicSharedSizeBytes << std::endl; 
+            if (cluster_size == < hypo_cluster_size) {
+                std::cout << "cluster size error" << cluster_size << std::endl;
             }
 
             auto grid_dim = dim3(cluster_size, 1, 1);
@@ -364,7 +378,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             config.dynamicSmemBytes =
                 (global_hist_size + local_hist_size + global_hist_prefix_size +
                  token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size + 1024) *
+                 local_offset_size) *
                 sizeof(int32_t);
 
             cudaLaunchAttribute attribute[1];
