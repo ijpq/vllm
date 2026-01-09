@@ -317,11 +317,30 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             config.dynamicSmemBytes =
                 (global_hist_size + local_hist_size + global_hist_prefix_size +
                  token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size) *
+                 local_offset_size + 1024) *
                 sizeof(int32_t);
-            cudaFuncSetAttribute(kernel_wrapper,
-                                 cudaFuncAttributeNonPortableClusterSizeAllowed,
-                                 1);
+            cudaError_t smem_err = cudaFuncSetAttribute(
+                kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                config.dynamicSmemBytes);
+            std::cout << "cudaFuncSetAttribute (MaxDynamicSharedMemorySize) "
+                         "returned: "
+                      << cudaGetErrorString(smem_err) << std::endl;
+            cudaError_t set_err = cudaFuncSetAttribute(
+                kernel_wrapper, cudaFuncAttributeNonPortableClusterSizeAllowed,
+                1);
+            std::cout << "cudaFuncSetAttribute returned: "
+                      << cudaGetErrorString(set_err) << std::endl;
+
+            cudaFuncAttributes attr;
+            cudaError_t attr_err = cudaFuncGetAttributes(&attr, kernel_wrapper);
+            std::cout << "cudaFuncGetAttributes: "
+                      << cudaGetErrorString(attr_err) << std::endl;
+            std::cout << "  binaryVersion: " << attr.binaryVersion
+                      << std::endl;  // 应该是 90 for sm_90
+            std::cout << "  maxDynamicSharedSizeBytes: "
+                      << attr.maxDynamicSharedSizeBytes << std::endl;
+            std::cout << "  sharedSizeBytes: " << attr.sharedSizeBytes
+                      << std::endl;
             cudaError_t err = cudaOccupancyMaxPotentialClusterSize(
                 &cluster_size, kernel_wrapper, &config);
 
@@ -330,9 +349,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             std::cout << "cluster size: " << cluster_size << std::endl;
             std::cout << "Req Smem: " << config.dynamicSmemBytes / 1024.f
                       << " Kbytes" << std::endl;
-            if (cluster_size == 0) {
-                std::cout << "fallback to 8 cluster" << std::endl;
-                cluster_size = 8;
+            if (cluster_size == 0 || config.dynamicSmemBytes > attr.maxDynamicSharedSizeBytes) {
+                std::cout << "cluster size error or dynamicsmem error: cluster size" <<
+                cluster_size << "," << "req smem: " << config.dynamicSmemBytes << ", max" << attr.maxDynamicSharedSizeBytes << std::endl; 
             }
 
             auto grid_dim = dim3(cluster_size, 1, 1);
@@ -345,7 +364,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             config.dynamicSmemBytes =
                 (global_hist_size + local_hist_size + global_hist_prefix_size +
                  token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size) *
+                 local_offset_size + 1024) *
                 sizeof(int32_t);
 
             cudaLaunchAttribute attribute[1];
