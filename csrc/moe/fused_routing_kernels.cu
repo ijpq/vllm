@@ -18,11 +18,11 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES>
 __global__ void fused_routing_kernel(
     __nv_bfloat16* __restrict__ topk_weights,
-    int16_t* __restrict__ topk_indices, const int64_t max_n_tiles,
+    int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
     const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
     int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
@@ -43,7 +43,7 @@ __global__ void fused_routing_kernel(
 template <>
 __global__ void fused_routing_kernel<32, 4, 4>(
     __nv_bfloat16* __restrict__ topk_weights,
-    int16_t* __restrict__ topk_indices, const int64_t max_n_tiles,
+    int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
     const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
     int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
@@ -112,12 +112,16 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     for (int i = row + local_tid; i < row_end;
          i += blockDim.x) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
-        int64_t row_experts =
-            *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
-        auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
-        auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
-        auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
-        auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
+        // int64_t row_experts =
+        //     *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
+        // auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
+        // auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
+        // auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
+        // auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
+        auto expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
+        auto expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
+        auto expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
+        auto expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
         int local_i = i - row;
         local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
         local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
@@ -246,6 +250,11 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
+        if (i >= NUM_TOKENS) {
+            printf("ERROR: CTA=%d tid=%d i=%d >= NUM_TOKENS=%ld\n", CTA_ID,
+                   local_tid, i, NUM_TOKENS);
+            continue;
+        }
         for (int k = 0; k < topk; k++) {
             int expert_id = topk_indices[i * topk_idx_stride + k];
             if (expert_id >= NUM_EXPERTS) printf("expt id: %d\n", expert_id);
@@ -255,13 +264,13 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             int expert_prior = prior_contrib[expert_id];
             int expert_local = local_offset_sm[local_i * topk + k];
             int global_pos = expert_base + expert_prior + expert_local;
-            // if (global_pos >= NUM_TOKENS * topk)
-            //     printf(
-            //         "out of bound : %d, expert_base: %d, expert_prior: %d, "
-            //         "expert_local: %d",
-            //         global_pos, expert_base, expert_prior, expert_local);
-            // if (flat_idx >= NUM_TOKENS * topk)
-            //     printf("out of bound : %d, i: %d", flat_idx, i);
+            if (global_pos >= NUM_TOKENS * topk)
+                printf(
+                    "out of bound : %d, expert_base: %d, expert_prior: %d, "
+                    "expert_local: %d",
+                    global_pos, expert_base, expert_prior, expert_local);
+            if (flat_idx >= NUM_TOKENS * topk)
+                printf("out of bound : %d, i: %d", flat_idx, i);
 
             gate_scale[global_pos] = val;
             topk_index[global_pos] = flat_idx;
@@ -292,6 +301,11 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     constexpr int NUM_BLOCK_SIZES = 4;
     const auto num_experts = gating_output.size(-1);
     const auto num_tokens = gating_output.numel() / num_experts;
+    std::cout << "=== fused_routing called ===" << std::endl;
+    std::cout << "  num_tokens: " << num_tokens << std::endl;
+    std::cout << "  num_experts: " << num_experts << std::endl;
+    std::cout << "  max_n_tiles: " << max_n_tiles << std::endl;
+    std::cout << "  topk: " << topk << std::endl;
 
     switch (num_experts) {
         case 32: {
@@ -310,10 +324,14 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size =
                 topk * rows_per_cta;  // Use actual rows_per_cta
+            auto kernel_wrapper =
+                &(vllm::moe::fused_routing_kernel<32, const_topk,
+                                                  NUM_BLOCK_SIZES>);
 
             cudaFuncAttributes attr;
+            cudaLaunchConfig_t config = {};
             // query static allocated sm size
-            auto cuda_error = cudaFuncGetAttributes(&attr, my_kernel_function);
+            auto cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
             TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
             size_t static_smem_size = attr.sharedSizeBytes;
             size_t required_dynamicSmemBytes =
@@ -321,7 +339,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                  token_offs_pad_size + block_pid_size + prefix_experts_size +
                  local_offset_size) *
                 sizeof(int32_t);
-            size_t requried_sm_size = static_smem + required_dynamicSmemBytes;
+            size_t requried_sm_size =
+                static_smem_size + required_dynamicSmemBytes;
+            config.dynamicSmemBytes = required_dynamicSmemBytes + 1024;
 
             // dev id
             int dev_id = 0;
@@ -335,10 +355,6 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             TORCH_CHECK(requried_sm_size <= max_hw_limit,
                         cudaGetErrorString(cuda_error));
 
-            cudaLaunchConfig_t config = {};
-            auto kernel_wrapper =
-                &(vllm::moe::fused_routing_kernel<32, const_topk,
-                                                  NUM_BLOCK_SIZES>);
             cuda_error = cudaFuncSetAttribute(
                 kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 config.dynamicSmemBytes);
@@ -364,7 +380,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             std::cout << "cluster size: " << cluster_size << std::endl;
             std::cout << "Req Smem: " << config.dynamicSmemBytes / 1024.f
                       << " Kbytes" << std::endl;
-            if (cluster_size == < hypo_cluster_size) {
+            if (cluster_size < hypo_cluster_size) {
                 std::cout << "cluster size error" << cluster_size << std::endl;
             }
 
@@ -423,10 +439,10 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
     /*
     dispatch dtype
     */
-    if (topk_indices.scalar_type() == at::ScalarType::Short &&
+    if (topk_indices.scalar_type() == at::ScalarType::Int &&
         gate_scale.scalar_type() == at::ScalarType::BFloat16 &&
         topk_weights.scalar_type() == at::ScalarType::BFloat16) {
-        routing_kernel_helper<int16_t, __nv_bfloat16>(
+        routing_kernel_helper<int32_t, __nv_bfloat16>(
             gating_output, topk_weights, topk_indices, max_n_tiles, topk,
             gate_scale, topk_index, gate_index, token_offs_pad, block_pid_map,
             expt_offs, hist);

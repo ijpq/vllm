@@ -1,0 +1,1 @@
+python3 -m pytest tests/kernels/moe/test_gpt_oss_triton_kernels.py -vv -s && python3 -m pytest tests/kernels/moe/test_fused_routing.py -vv -s

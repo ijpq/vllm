@@ -183,7 +183,7 @@ def compare_routing_results(
 class TestFusedRouting:
     """Test suite for comparing fused_routing with triton_kernels.routing.routing"""
     
-    @pytest.mark.parametrize("num_tokens", [16, 32, 64, 128, 256, 512])
+    @pytest.mark.parametrize("num_tokens", [1, 16, 32, 64, 128, 256, 512, 4096])
     @pytest.mark.parametrize("num_experts", [32])  # Currently only 32 experts supported
     @pytest.mark.parametrize("topk", [4])  # Currently only topk=4 supported
     def test_routing_consistency(self, num_tokens: int, num_experts: int, topk: int):

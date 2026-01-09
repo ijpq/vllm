@@ -142,8 +142,8 @@ def fused_routing(
     )
 
     # Convert to expected dtypes for CUDA kernel
-    topk_weights = topk_weights.to(dtype)  # bfloat16
-    topk_indices = topk_indices.to(torch.int16)
+    topk_weights = topk_weights.to(dtype).contiguous()  # bfloat16
+    # topk_indices = topk_indices.to(torch.int16).contiguous()
     ops.fused_routing(
         router_logits,
         topk_weights,
