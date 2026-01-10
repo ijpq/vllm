@@ -6,6 +6,7 @@
 #include "../cub_helpers.h"
 #include <cooperative_groups.h>
 
+#define KERNEL_DEBUG 1
 #ifndef USE_ROCM
     #include <cuda_bf16.h>
     #include <cuda_fp16.h>
@@ -112,21 +113,43 @@ __global__ void fused_routing_kernel<32, 4, 4>(
     for (int i = row + local_tid; i < row_end;
          i += blockDim.x) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
-        // int64_t row_experts =
-        //     *reinterpret_cast<int64_t*>((topk_indices) + i * topk);
-        // auto expt0 = static_cast<int32_t>(row_experts & 0xFFFF);
-        // auto expt1 = static_cast<int32_t>(row_experts >> 16 & 0xFFFF);
-        // auto expt2 = static_cast<int32_t>(row_experts >> 32 & 0xFFFF);
-        // auto expt3 = static_cast<int32_t>(row_experts >> 48 & 0xFFFF);
-        auto expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
-        auto expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
-        auto expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
-        auto expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
+#if KERNEL_DEBUG
+        int expt0, expt1, expt2, expt3;
+        if (i >=0 && i < NUM_TOKENS) {
+            expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
+            expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
+            expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
+            expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
+        } else {
+            printf("error row idx: %d\n", i);
+        }
+        // Bounds check - clamp expert indices to valid range [0, NUM_EXPERTS-1]
+        // This prevents shared memory out-of-bounds access during CUDA graph
+        // capture when topk_indices may contain uninitialized/garbage values
+        int local_i = i - row;
+        if (expt0 >= 0 && expt0 <= NUM_EXPERTS)
+            local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
+        if (expt1 >= 0 && expt1 <= NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 1] =
+                atomicAdd(local_hist + expt1, 1);
+        if (expt2 >= 0 && expt2 <= NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 2] =
+                atomicAdd(local_hist + expt2, 1);
+        if (expt3 >= 0 && expt3 <= NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 3] =
+                atomicAdd(local_hist + expt3, 1);
+#else
+        int expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
+        int expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
+        int expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
+        int expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
         int local_i = i - row;
         local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
         local_offset_sm[local_i * topk + 1] = atomicAdd(local_hist + expt1, 1);
         local_offset_sm[local_i * topk + 2] = atomicAdd(local_hist + expt2, 1);
         local_offset_sm[local_i * topk + 3] = atomicAdd(local_hist + expt3, 1);
+
+#endif
     }
     __syncthreads();  // to ensure local_hist in SM finish.
     int32_t* global_hist = cluster.map_shared_rank(
@@ -256,8 +279,42 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             continue;
         }
         for (int k = 0; k < topk; k++) {
+#if KERNEL_DEBUG
+            if (i >= 0 && i < NUM_TOKENS) {
+                int expert_id = topk_indices[i * topk_idx_stride + k];
+                // Bounds check - clamp expert indices to valid range [0,
+                // NUM_EXPERTS-1] This prevents shared memory out-of-bounds
+                // access during CUDA graph capture
+                if (expert_id >= 0 && expert_id <= NUM_EXPERTS) {
+                    __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
+                    int flat_idx = i * topk + k;
+                    int expert_base = hist_sum_local[expert_id];
+                    int expert_prior = prior_contrib[expert_id];
+                    int expert_local = local_offset_sm[local_i * topk + k];
+                    int global_pos = expert_base + expert_prior + expert_local;
+                    if (global_pos >= NUM_TOKENS * topk)
+                        printf(
+                            "out of bound : %d, expert_base: %d, expert_prior: "
+                            "%d, "
+                            "expert_local: %d",
+                            global_pos, expert_base, expert_prior,
+                            expert_local);
+                    if (flat_idx >= NUM_TOKENS * topk)
+                        printf("out of bound : %d, i: %d", flat_idx, i);
+                    if (global_pos < NUM_TOKENS*topk && flat_idx < NUM_TOKENS * topk) {
+                    gate_scale[global_pos] = val;
+                    topk_index[global_pos] = flat_idx;
+                    gate_index[flat_idx] = global_pos;
+
+                    }
+                } else {
+                    printf("error expt id: %d\n", expert_id);
+                }
+            } else {
+                printf("error rowidx : %d\n", i);
+            }
+#else
             int expert_id = topk_indices[i * topk_idx_stride + k];
-            if (expert_id >= NUM_EXPERTS) printf("expt id: %d\n", expert_id);
             __nv_bfloat16 val = topk_weights[i * topk_val_stride + k];
             int flat_idx = i * topk + k;
             int expert_base = hist_sum_local[expert_id];
@@ -275,6 +332,7 @@ __global__ void fused_routing_kernel<32, 4, 4>(
             gate_scale[global_pos] = val;
             topk_index[global_pos] = flat_idx;
             gate_index[flat_idx] = global_pos;
+#endif
         }
     }
 }
