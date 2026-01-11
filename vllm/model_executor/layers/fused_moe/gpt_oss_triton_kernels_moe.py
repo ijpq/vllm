@@ -122,9 +122,6 @@ def fused_routing(
     block_pid_map = torch.full(
         (NUM_BLOCK_SIZES, max_n_tiles), -1, device=device, dtype=torch.int32
     )
-    if torch.isnan(router_logits).any():
-        print("Fatal: router_logits contains NaN!")
-    print(f"Max expert id: {topk_indices.max()}")
 
 
     # device_props = torch.cuda.get_device_properties(device)
@@ -143,11 +140,8 @@ def fused_routing(
     ops.topk_softmax(
         topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
     )
-    if torch.isnan(router_logits).any():
-        print("Fatal: router_logits contains NaN!")
-    print(f"Max expert id: {topk_indices.max()}")
     # Convert to expected dtypes for CUDA kernel
-    topk_weights = topk_weights.to(dtype).contiguous()  # bfloat16
+    topk_weights = topk_weights.contiguous()  # bfloat16
     topk_indices = topk_indices.contiguous()
     # topk_indices = topk_indices.to(torch.int16).contiguous()
     ops.fused_routing(
