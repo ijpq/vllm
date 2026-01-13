@@ -204,8 +204,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     }
     cluster.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
+        int32_t* global_hist_sm0 = reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         int lane_id = threadIdx.x % 32;
-        int h = global_hist[lane_id];
+        int h = global_hist_sm0[lane_id];
         // compute global hist prefixsum
         if (warp_id == 0) {
             int exclusive_res = 0;
@@ -472,11 +473,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             // recompute SM
             rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
             local_offset_size = topk * rows_per_cta;  // Use actual rows_per_cta
-            config.dynamicSmemBytes =
-                (global_hist_size + local_hist_size + global_hist_prefix_size +
-                 token_offs_pad_size + block_pid_size + prefix_experts_size +
-                 local_offset_size) *
-                sizeof(int32_t);
+            // try to fix shared memory size
+            // config.dynamicSmemBytes =
+            //     (global_hist_size + local_hist_size + global_hist_prefix_size +
+            //      token_offs_pad_size + block_pid_size + prefix_experts_size +
+            //      local_offset_size) *
+            //     sizeof(int32_t);
 
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeClusterDimension;
