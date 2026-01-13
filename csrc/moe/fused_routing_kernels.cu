@@ -488,6 +488,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             attribute[0].val.clusterDim.z = 1;
             config.attrs = attribute;
             config.numAttrs = 1;
+            const cudaStream_t current_stream = at::cuda::getCurrentCUDAStream();
+            config.stream = current_stream;
 
             auto topk_weights_ptr =
                 reinterpret_cast<InValType*>(topk_weights.data_ptr());
