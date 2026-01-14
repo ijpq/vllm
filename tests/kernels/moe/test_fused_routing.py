@@ -184,7 +184,7 @@ class TestFusedRouting:
     """Test suite for comparing fused_routing with triton_kernels.routing.routing"""
     
     @pytest.mark.parametrize("num_tokens", [1, 16, 32, 64, 128, 256, 512, 4096])
-    @pytest.mark.parametrize("num_experts", [32])  # Currently only 32 experts supported
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
     @pytest.mark.parametrize("topk", [4])  # Currently only topk=4 supported
     def test_routing_consistency(self, num_tokens: int, num_experts: int, topk: int):
         """
@@ -212,14 +212,14 @@ class TestFusedRouting:
             error_msg = "\n".join(errors)
             pytest.fail(f"Routing results mismatch:\n{error_msg}")
     
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
     @pytest.mark.parametrize("num_tokens", [16, 64, 256])
-    def test_histogram_correctness(self, num_tokens: int):
+    def test_histogram_correctness(self, num_tokens: int, num_experts: int):
         """
         Test that the histogram (tokens per expert) is computed correctly.
         """
         torch.manual_seed(123)
         device = "cuda"
-        num_experts = 32
         topk = 4
         
         router_logits = torch.randn(
@@ -246,14 +246,14 @@ class TestFusedRouting:
         assert torch.equal(fused_hist, triton_hist), \
             f"Histogram mismatch: fused={fused_hist.tolist()}, triton={triton_hist.tolist()}"
     
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
     @pytest.mark.parametrize("num_tokens", [16, 64, 256])
-    def test_gate_scale_values(self, num_tokens: int):
+    def test_gate_scale_values(self, num_tokens: int, num_experts):
         """
         Test that gate_scale values are valid softmax probabilities.
         """
         torch.manual_seed(456)
         device = "cuda"
-        num_experts = 32
         topk = 4
         
         router_logits = torch.randn(
@@ -291,13 +291,13 @@ class TestFusedRouting:
             f"triton gate_scale sum {triton_sum} too far from expected {expected_sum}"
     
     @pytest.mark.parametrize("num_tokens", [16, 64, 128])
-    def test_token_offs_pad_consistency(self, num_tokens: int):
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
+    def test_token_offs_pad_consistency(self, num_tokens: int, num_experts: int):
         """
         Test that token_offs_pad is computed correctly for different block sizes.
         """
         torch.manual_seed(789)
         device = "cuda"
-        num_experts = 32
         topk = 4
         
         router_logits = torch.randn(
@@ -331,14 +331,14 @@ class TestFusedRouting:
             assert fused_pad[0] == 0, f"fused token_offs_pad[{block_m}][0] != 0"
             assert triton_pad[0] == 0, f"triton token_offs_pad[{block_m}][0] != 0"
     
-    def test_determinism(self):
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
+    def test_determinism(self, num_experts: int):
         """
         Test that fused_routing produces deterministic results.
         """
         torch.manual_seed(999)
         device = "cuda"
         num_tokens = 128
-        num_experts = 32
         topk = 4
         
         router_logits = torch.randn(
@@ -362,7 +362,8 @@ class TestFusedRouting:
 
 class TestFusedRoutingEdgeCases:
     """Edge case tests for fused_routing"""
-    def test_uniform_distribution(self):
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
+    def test_uniform_distribution(self, num_experts: int):
         """
         Test with uniform logits (all experts equally likely).
         Note: topk_softmax has deterministic tie-breaking (selects lowest indices),
@@ -370,7 +371,6 @@ class TestFusedRoutingEdgeCases:
         """
         device = "cuda"
         num_tokens = 64
-        num_experts = 32
         topk = 4
 
         router_logits = torch.ones(
@@ -389,13 +389,13 @@ class TestFusedRoutingEdgeCases:
         # With deterministic tie-breaking, first topk experts get all tokens
         # This is expected behavior for topk_softmax
    
-    def test_sparse_routing(self):
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
+    def test_sparse_routing(self, num_experts: int):
         """
         Test with sparse logits (only a few experts active).
         """
         device = "cuda"
         num_tokens = 64
-        num_experts = 32
         topk = 4
         
         # Set logits such that only first 4 experts are selected
@@ -420,14 +420,14 @@ class TestFusedRoutingEdgeCases:
         assert (fused_hist[topk:] == 0).all(), \
             f"Inactive experts should have 0 tokens, got {fused_hist[topk:].tolist()}"
     
-    def test_large_logit_values(self):
+    @pytest.mark.parametrize("num_experts", [32,128])  # Currently only 32 experts supported
+    def test_large_logit_values(self, num_experts:int):
         """
         Test with very large logit values (numerical stability).
         """
         torch.manual_seed(111)
         device = "cuda"
         num_tokens = 64
-        num_experts = 32
         topk = 4
         
         # Large logit values

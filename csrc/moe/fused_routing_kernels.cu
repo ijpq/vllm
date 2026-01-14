@@ -19,7 +19,7 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
 
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype,
           typename OutValDtype>
@@ -48,6 +48,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cg::cluster_group cluster = cg::this_cluster();
 
     int local_tid = threadIdx.x;
+    int blockdimx = blockDim.x;
     int tid = local_tid + blockDim.x * blockIdx.x;
     int CTA_ID = blockIdx.x;
     int num_threads = blockDim.x * gridDim.x;
@@ -70,11 +71,13 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     [NUM_EXPERTS]: exclusivesum for experts
     [ROWS_PER_CTA*topk]: local_offset
     */
-    using BlockScan = cub::BlockScan<int, NUM_EXPERTS>;
-    using WarpScan = cub::WarpScan<int>;
+    using BlockScan = cub::BlockScan<int, 512>;
+    // using WarpScan = cub::WarpScan<int>;
     __shared__ typename BlockScan::TempStorage temp_storage_hist;
     __shared__
-        typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
+        typename BlockScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
+    // __shared__
+    //     typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ int32_t sm_hist[];
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
@@ -175,7 +178,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
 
     /* phase 2*/
-    int warp_id = threadIdx.x / 32;
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // TODO(ijpq): we can leverage warpscan to improve this process, but need
@@ -196,12 +198,16 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
     }
     cluster.sync();
-    if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
+    int h = 0;
+    int lane_id = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    // int hist_idx = warp_id * warp_size + lane_id;
+    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
         int32_t* global_hist_sm0 =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-        int lane_id = threadIdx.x % 32;
-        int hist_idx = warp_id * warp_size + lane_id;
-        int h = global_hist_sm0[hist_idx];
+        h = global_hist_sm0[local_tid];
+    }
+    if (CTA_ID == 0) {
         // compute global hist prefixsum
         int block_exclusive_res = 0;
         int block_reduce = 0;
@@ -209,34 +215,37 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             .ExclusiveSum(h, block_exclusive_res, block_reduce);
         int32_t* hist_sum = reinterpret_cast<int32_t*>(
             sm_hist + global_hist_exclusivesum_offset);
-        hist_sum[hist_idx] = block_exclusive_res;
-        if (local_tid == 0) hist_sum[NUM_EXPERTS] = block_reduce;
-
-        // align the data with triton's matmul_ogs
-        int BLOCK_M_LOG2_START = 4;
-        int block_m_log2 = BLOCK_M_LOG2_START + warp_id;
-        int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
-        int32_t* pid_map_row =
-            reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
-            warp_id * max_n_tiles;
-        int n_tiles = (h + block_m - 1) / block_m;
-        int warp_reduce = 0;
-        int exclusive_res = 0;
-        WarpScan(temp_storage_tiles[warp_id])
-            .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
-
-        int32_t* token_offs_pad =
-            reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
-        token_offs_pad[warp_id * (NUM_EXPERTS + 1) + lane_id] = exclusive_res;
-        if (lane_id == 0)
-            token_offs_pad[warp_id * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
-                warp_reduce;
-        // __syncwarp(); // since the last pos won't be read in this loop.
-
-        int tile_start = exclusive_res;
-        for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
-            int packed_val = (block_idx << 16) | lane_id;
-            pid_map_row[(tile_start + block_idx)] = packed_val;
+        if (local_tid < NUM_EXPERTS) {
+            hist_sum[local_tid] = block_exclusive_res;
+            if (local_tid == 0) hist_sum[NUM_EXPERTS] = block_reduce;
+        }
+#pragma unroll
+        for (int size = 0; size < NUM_BLOCK_SIZES; size += 1) {
+            int BLOCK_M_LOG2_START = 4;
+            int block_m_log2 = BLOCK_M_LOG2_START + size;
+            int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
+            int n_tiles = FUSED_ROUTING_CEIL_DIV(h, block_m);
+            int tiles_exclusive_res = 0;
+            int tiles_reduce = 0;
+            BlockScan(temp_storage_tiles[size])
+                .ExclusiveSum(n_tiles, tiles_exclusive_res, tiles_reduce);
+            int32_t* pid_map_row =
+                reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
+                size * max_n_tiles;
+            int32_t* token_offs_pad =
+                reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
+            if (local_tid < NUM_EXPERTS) {
+                token_offs_pad[size * (NUM_EXPERTS + 1) + local_tid] =
+                    tiles_exclusive_res;
+                if (local_tid == 0)
+                    token_offs_pad[size * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
+                        tiles_reduce;
+                int tile_start = tiles_reduce;
+                for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
+                    int packed_val = (block_idx << 16) | local_tid;
+                    pid_map_row[(tile_start + block_idx)] = packed_val;
+                }
+            }
         }
     }
     cluster.sync();
