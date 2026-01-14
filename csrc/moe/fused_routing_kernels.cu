@@ -240,7 +240,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 if (local_tid == 0)
                     token_offs_pad[size * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
                         tiles_reduce;
-                int tile_start = tiles_reduce;
+                int tile_start = tiles_exclusive_res;
                 for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
                     int packed_val = (block_idx << 16) | local_tid;
                     pid_map_row[(tile_start + block_idx)] = packed_val;
