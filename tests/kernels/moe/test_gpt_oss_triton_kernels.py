@@ -292,7 +292,7 @@ class Case:
 @pytest.mark.parametrize("num_token", [2, 128])
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 @pytest.mark.parametrize(
-    "GPTOSSModelConfig", [GPTOSS20BModelConfig]
+    "GPTOSSModelConfig", [GPTOSS20BModelConfig, GPTOSS120BModelConfig]
 )
 def test_equiv(num_token, a_dtype, w_dtype, tp, GPTOSSModelConfig):
     from triton_kernels.tensor_details import layout

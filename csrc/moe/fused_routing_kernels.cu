@@ -6,7 +6,7 @@
 #include "../cub_helpers.h"
 #include <cooperative_groups.h>
 
-#define KERNEL_DEBUG 0
+#define KERNEL_DEBUG 1
 #ifndef USE_ROCM
     #include <cuda_bf16.h>
     #include <cuda_fp16.h>
@@ -19,30 +19,22 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
-template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype, typename OutValDtype>
-__global__ void fused_routing_kernel(
-    InValDtype* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
-    const int64_t NUM_TOKENS, OutValDtype* __restrict__ gate_scale,
-    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
-    int32_t* __restrict__ token_offs_pad_ptr,
-    int32_t* __restrict__ block_pid_map_ptr,
-    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr);
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
 
-// template<>
-// __global__
-// void fused_routing_kernel<128>( float* __restrict__ router_logits,
-//                            float* __restrict__ topk_weights,
-//                            int16_t* __restrict__ topk_indices,
-//                            float* __restrict__ gate_scale,
-//                            int16_t* __restrict__ topk_index,
-//                            int32_t* __restrict__ gate_index,
-//                           int64_t max_n_tiles,  int64_t topk) {
-// }
+template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype,
+          typename OutValDtype>
+__global__ void fused_routing_kernel(
+    InValDtype* __restrict__ topk_weights, int32_t* __restrict__ topk_indices,
+    const int64_t max_n_tiles, const int64_t NUM_TOKENS,
+    OutValDtype* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
+    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
+    int32_t* __restrict__ block_pid_map_ptr,
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+    TORCH_CHECK(false, "unimplemented kernel");
+}
 
 template <>
-__global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
+__global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     __nv_bfloat16* __restrict__ topk_weights,
     int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
     const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
@@ -50,7 +42,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
-    // static_assert(alignof(topk_indices) == 128);
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
     namespace cg = cooperative_groups;
@@ -60,7 +51,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int tid = local_tid + blockDim.x * blockIdx.x;
     int CTA_ID = blockIdx.x;
     int num_threads = blockDim.x * gridDim.x;
-    static constexpr int NUM_EXPERTS = 32;
+    static constexpr int NUM_EXPERTS = 128;
     static constexpr int topk = 4;
     static constexpr int NUM_BLOCK_SIZES = 4;
     int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
@@ -79,9 +70,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     [NUM_EXPERTS]: exclusivesum for experts
     [ROWS_PER_CTA*topk]: local_offset
     */
+    using BlockScan = cub::BlockScan<int, NUM_EXPERTS>;
     using WarpScan = cub::WarpScan<int>;
-    __shared__ typename WarpScan::TempStorage temp_storage_hist[NUM_EXPERTS/warp_size];
-    __shared__ typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
+    __shared__ typename BlockScan::TempStorage temp_storage_hist;
+    __shared__
+        typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ int32_t sm_hist[];
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
@@ -94,14 +87,14 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
-    
+
     // Step 1: Zero-initialize entire shared memory
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
         sm_hist[i] = 0;
     }
     __syncthreads();  // Ensure all threads complete zeroing before setting -1
-    
+
     // Step 2: Set block_pid_map region to -1
 #pragma unroll
     for (int i = local_tid; i < NUM_BLOCK_SIZES * (max_n_tiles);
@@ -124,7 +117,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                              // sizeof(topk_indices)
 #if KERNEL_DEBUG
         int expt0, expt1, expt2, expt3;
-        if (i >=0 && i < NUM_TOKENS) {
+        if (i >= 0 && i < NUM_TOKENS) {
             expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
             expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
             expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
@@ -149,12 +142,12 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 atomicAdd(local_hist + expt3, 1);
 #else
         int expt0, expt1, expt2, expt3;
-        if (i >=0 && i < NUM_TOKENS) {
+        if (i >= 0 && i < NUM_TOKENS) {
             expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
             expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
             expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
             expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
-        } 
+        }
         // Bounds check - clamp expert indices to valid range [0, NUM_EXPERTS-1]
         // This prevents shared memory out-of-bounds access during CUDA graph
         // capture when topk_indices may contain uninitialized/garbage values
@@ -204,7 +197,326 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     }
     cluster.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
-        int32_t* global_hist_sm0 = reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+        int32_t* global_hist_sm0 =
+            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+        int lane_id = threadIdx.x % 32;
+        int hist_idx = warp_id * warp_size + lane_id;
+        int h = global_hist_sm0[hist_idx];
+        // compute global hist prefixsum
+        int block_exclusive_res = 0;
+        int block_reduce = 0;
+        BlockScan(temp_storage_hist)
+            .ExclusiveSum(h, block_exclusive_res, block_reduce);
+        int32_t* hist_sum = reinterpret_cast<int32_t*>(
+            sm_hist + global_hist_exclusivesum_offset);
+        hist_sum[hist_idx] = block_exclusive_res;
+        if (local_tid == 0) hist_sum[NUM_EXPERTS] = block_reduce;
+
+        // align the data with triton's matmul_ogs
+        int BLOCK_M_LOG2_START = 4;
+        int block_m_log2 = BLOCK_M_LOG2_START + warp_id;
+        int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
+        int32_t* pid_map_row =
+            reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
+            warp_id * max_n_tiles;
+        int n_tiles = (h + block_m - 1) / block_m;
+        int warp_reduce = 0;
+        int exclusive_res = 0;
+        WarpScan(temp_storage_tiles[warp_id])
+            .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
+
+        int32_t* token_offs_pad =
+            reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
+        token_offs_pad[warp_id * (NUM_EXPERTS + 1) + lane_id] = exclusive_res;
+        if (lane_id == 0)
+            token_offs_pad[warp_id * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
+                warp_reduce;
+        // __syncwarp(); // since the last pos won't be read in this loop.
+
+        int tile_start = exclusive_res;
+        for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
+            int packed_val = (block_idx << 16) | lane_id;
+            pid_map_row[(tile_start + block_idx)] = packed_val;
+        }
+    }
+    cluster.sync();
+
+    // WB global memory
+    int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
+    int pid_map_size = NUM_BLOCK_SIZES * (max_n_tiles);
+
+    if (CTA_ID == 0) {
+        int32_t* token_offs_pad =
+            reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
+        int32_t* block_pid =
+            reinterpret_cast<int32_t*>(sm_hist + block_pid_offset);
+        for (int i = local_tid; i < token_offs_pad_size; i += blockDim.x)
+            token_offs_pad_ptr[i] = token_offs_pad[i];
+        for (int i = local_tid; i < pid_map_size; i += blockDim.x)
+            block_pid_map_ptr[i] = block_pid[i];
+    }
+    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
+        int32_t* hist_sum = reinterpret_cast<int32_t*>(
+            sm_hist + global_hist_exclusivesum_offset);
+        int32_t* global_hist_sm =
+            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+        expt_offs_ptr[local_tid] = hist_sum[local_tid];
+        hist_ptr[local_tid] = global_hist_sm[local_tid];
+        if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
+    }
+    cluster.sync();
+
+    /* phase 3*/
+
+    int32_t* prior_contrib =
+        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
+
+    /*
+    WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
+    cudaErrorLaunchFailure.
+    */
+    int32_t* hist_sum_sm0 = cluster.map_shared_rank(
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
+        0);
+    int32_t* hist_sum_local =
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
+    if (local_tid < NUM_EXPERTS)
+        hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
+    cluster.sync();
+
+#pragma unroll
+    for (int i = row + local_tid; i < row_end; i += blockDim.x) {
+        int local_i = i - row;
+        int topk_idx_stride = topk, topk_val_stride = topk;
+        for (int k = 0; k < topk; k++) {
+#if KERNEL_DEBUG
+            if (i >= 0 && i < NUM_TOKENS) {
+                int expert_id = topk_indices[i * topk_idx_stride + k];
+                // Bounds check - clamp expert indices to valid range [0,
+                // NUM_EXPERTS-1] This prevents shared memory out-of-bounds
+                // access during CUDA graph capture
+                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+                    InValDtype val = topk_weights[i * topk_val_stride + k];
+                    int flat_idx = i * topk + k;
+                    int expert_base = hist_sum_local[expert_id];
+                    int expert_prior = prior_contrib[expert_id];
+                    int expert_local = local_offset_sm[local_i * topk + k];
+                    int global_pos = expert_base + expert_prior + expert_local;
+                    if (global_pos >= NUM_TOKENS * topk)
+                        printf(
+                            "out of bound : %d, expert_base: %d, expert_prior: "
+                            "%d, "
+                            "expert_local: %d",
+                            global_pos, expert_base, expert_prior,
+                            expert_local);
+                    if (flat_idx >= NUM_TOKENS * topk)
+                        printf("out of bound : %d, i: %d", flat_idx, i);
+                    if (global_pos < NUM_TOKENS * topk &&
+                        flat_idx < NUM_TOKENS * topk) {
+                        gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                        topk_index[global_pos] = flat_idx;
+                        gate_index[flat_idx] = global_pos;
+                    }
+                } else {
+                    printf("error expt id: %d\n", expert_id);
+                }
+            } else {
+                printf("error rowidx : %d\n", i);
+            }
+#else
+            if (i >= 0 && i < NUM_TOKENS) {
+                int expert_id = topk_indices[i * topk_idx_stride + k];
+                // Bounds check - clamp expert indices to valid range [0,
+                // NUM_EXPERTS-1] This prevents shared memory out-of-bounds
+                // access during CUDA graph capture
+                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+                    InValDtype val = topk_weights[i * topk_val_stride + k];
+                    int flat_idx = i * topk + k;
+                    int expert_base = hist_sum_local[expert_id];
+                    int expert_prior = prior_contrib[expert_id];
+                    int expert_local = local_offset_sm[local_i * topk + k];
+                    int global_pos = expert_base + expert_prior + expert_local;
+
+                    if (global_pos < NUM_TOKENS * topk &&
+                        flat_idx < NUM_TOKENS * topk) {
+                        gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                        topk_index[global_pos] = flat_idx;
+                        gate_index[flat_idx] = global_pos;
+                    }
+                }
+            }
+
+#endif
+        }
+    }
+}
+
+template <>
+__global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
+    __nv_bfloat16* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
+    const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
+    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
+    int32_t* __restrict__ token_offs_pad_ptr,
+    int32_t* __restrict__ block_pid_map_ptr,
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+    using InValDtype = __nv_bfloat16;
+    using OutValDtype = __nv_bfloat16;
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+
+    int local_tid = threadIdx.x;
+    int tid = local_tid + blockDim.x * blockIdx.x;
+    int CTA_ID = blockIdx.x;
+    int num_threads = blockDim.x * gridDim.x;
+    static constexpr int NUM_EXPERTS = 32;
+    static constexpr int topk = 4;
+    static constexpr int NUM_BLOCK_SIZES = 4;
+    int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
+    int ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, gridDim.x);
+    int HYPO_ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, 8);
+    static constexpr int warp_size = 32;
+
+    // shared memory layout
+    /*
+    Assumingly, shared Mem is organized as this layout:
+    [NUM_EXPERTS] : global hist !only 0
+    [NUM_EXPERTS] : local histgram for each threadblock
+    [NUM_EXPERTS+1]: global hist exclusive-sum !only 0
+    [NUM_BLOCK_SIZES, NUM_EXPERTS+1] : token_offs_pad
+    [NUM_BLOCK_SIZES, max_n_tiles] : block_pid
+    [NUM_EXPERTS]: exclusivesum for experts
+    [ROWS_PER_CTA*topk]: local_offset
+    */
+    using WarpScan = cub::WarpScan<int>;
+    __shared__ typename WarpScan::TempStorage
+        temp_storage_hist[NUM_EXPERTS / warp_size];
+    __shared__
+        typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
+    extern __shared__ int32_t sm_hist[];
+    int global_hist_offset = 0;
+    int local_hist_offset = NUM_EXPERTS;
+    int global_hist_exclusivesum_offset = local_hist_offset + NUM_EXPERTS;
+    int token_offs_pad_offset =
+        global_hist_exclusivesum_offset + NUM_EXPERTS + 1;
+    int block_pid_offset =
+        token_offs_pad_offset + (NUM_BLOCK_SIZES * (NUM_EXPERTS + 1));
+    int expert_across_offset =
+        block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
+    int local_offset_offset = expert_across_offset + NUM_EXPERTS;
+    int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
+
+    // Step 1: Zero-initialize entire shared memory
+#pragma unroll
+    for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
+        sm_hist[i] = 0;
+    }
+    __syncthreads();  // Ensure all threads complete zeroing before setting -1
+
+    // Step 2: Set block_pid_map region to -1
+#pragma unroll
+    for (int i = local_tid; i < NUM_BLOCK_SIZES * (max_n_tiles);
+         i += blockDim.x) {
+        sm_hist[block_pid_offset + i] = -1;
+    }
+    cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
+
+    /*phase 1*/
+    int32_t* local_hist =
+        reinterpret_cast<int32_t*>(sm_hist + local_hist_offset);
+    int32_t* local_offset_sm =
+        reinterpret_cast<int32_t*>(sm_hist + local_offset_offset);
+    int row = CTA_ID * ROWS_PER_CTA;
+    int row_end = min((int64_t)(row + ROWS_PER_CTA),
+                      NUM_TOKENS);  // Each CTA only processes its own rows
+#pragma unroll
+    for (int i = row + local_tid; i < row_end;
+         i += blockDim.x) {  // mem transaction = warp_size * topk *
+                             // sizeof(topk_indices)
+#if KERNEL_DEBUG
+        int expt0, expt1, expt2, expt3;
+        if (i >= 0 && i < NUM_TOKENS) {
+            expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
+            expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
+            expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
+            expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
+        } else {
+            printf("error row idx: %d\n", i);
+        }
+        // Bounds check - clamp expert indices to valid range [0, NUM_EXPERTS-1]
+        // This prevents shared memory out-of-bounds access during CUDA graph
+        // capture when topk_indices may contain uninitialized/garbage values
+        int local_i = i - row;
+        if (expt0 >= 0 && expt0 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
+        if (expt1 >= 0 && expt1 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 1] =
+                atomicAdd(local_hist + expt1, 1);
+        if (expt2 >= 0 && expt2 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 2] =
+                atomicAdd(local_hist + expt2, 1);
+        if (expt3 >= 0 && expt3 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 3] =
+                atomicAdd(local_hist + expt3, 1);
+#else
+        int expt0, expt1, expt2, expt3;
+        if (i >= 0 && i < NUM_TOKENS) {
+            expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
+            expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
+            expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
+            expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
+        }
+        // Bounds check - clamp expert indices to valid range [0, NUM_EXPERTS-1]
+        // This prevents shared memory out-of-bounds access during CUDA graph
+        // capture when topk_indices may contain uninitialized/garbage values
+        int local_i = i - row;
+        if (expt0 >= 0 && expt0 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk] = atomicAdd(local_hist + expt0, 1);
+        if (expt1 >= 0 && expt1 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 1] =
+                atomicAdd(local_hist + expt1, 1);
+        if (expt2 >= 0 && expt2 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 2] =
+                atomicAdd(local_hist + expt2, 1);
+        if (expt3 >= 0 && expt3 < NUM_EXPERTS)
+            local_offset_sm[local_i * topk + 3] =
+                atomicAdd(local_hist + expt3, 1);
+
+#endif
+    }
+    cluster.sync();
+    int32_t* global_hist = cluster.map_shared_rank(
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset), 0);
+    if (local_tid < NUM_EXPERTS) {
+        atomicAdd(global_hist + local_tid, local_hist[local_tid]);
+    }
+    cluster.sync();
+
+    /* phase 2*/
+    int warp_id = threadIdx.x / 32;
+    // compute expert_across_prefixsum, dst_experts[i] =
+    // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
+    // TODO(ijpq): we can leverage warpscan to improve this process, but need
+    // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
+    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
+        for (int bidx = 1; bidx < gridDim.x; bidx++) {
+            int32_t* dst_experts = cluster.map_shared_rank(
+                reinterpret_cast<int32_t*>(sm_hist + expert_across_offset),
+                bidx);
+            int32_t* tb_local_hist = cluster.map_shared_rank(
+                reinterpret_cast<int32_t*>(sm_hist + local_hist_offset),
+                bidx - 1);
+            int32_t* accum_hist = cluster.map_shared_rank(
+                reinterpret_cast<int32_t*>(sm_hist + expert_across_offset),
+                bidx - 1);
+            dst_experts[local_tid] =
+                tb_local_hist[local_tid] + accum_hist[local_tid];
+        }
+    }
+    cluster.sync();
+    if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
+        int32_t* global_hist_sm0 =
+            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         int lane_id = threadIdx.x % 32;
         int h = global_hist_sm0[lane_id];
         // compute global hist prefixsum
@@ -318,11 +630,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                             expert_local);
                     if (flat_idx >= NUM_TOKENS * topk)
                         printf("out of bound : %d, i: %d", flat_idx, i);
-                    if (global_pos < NUM_TOKENS*topk && flat_idx < NUM_TOKENS * topk) {
-                    gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                    topk_index[global_pos] = flat_idx;
-                    gate_index[flat_idx] = global_pos;
-
+                    if (global_pos < NUM_TOKENS * topk &&
+                        flat_idx < NUM_TOKENS * topk) {
+                        gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                        topk_index[global_pos] = flat_idx;
+                        gate_index[flat_idx] = global_pos;
                     }
                 } else {
                     printf("error expt id: %d\n", expert_id);
@@ -344,14 +656,14 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     int expert_local = local_offset_sm[local_i * topk + k];
                     int global_pos = expert_base + expert_prior + expert_local;
 
-                    if (global_pos < NUM_TOKENS*topk && flat_idx < NUM_TOKENS * topk) {
-                    gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                    topk_index[global_pos] = flat_idx;
-                    gate_index[flat_idx] = global_pos;
-
+                    if (global_pos < NUM_TOKENS * topk &&
+                        flat_idx < NUM_TOKENS * topk) {
+                        gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                        topk_index[global_pos] = flat_idx;
+                        gate_index[flat_idx] = global_pos;
                     }
-                } 
-            } 
+                }
+            }
 
 #endif
         }
@@ -365,9 +677,8 @@ template <typename IdxType, typename InValType, typename OutValType>
 void routing_kernel_helper(torch::Tensor& gating_output,
                            torch::Tensor& topk_weights,
                            torch::Tensor& topk_indices, int64_t max_n_tiles,
-                           int64_t topk,
-                           torch::Tensor& gate_scale, torch::Tensor& topk_index,
-                           torch::Tensor& gate_index,
+                           int64_t topk, torch::Tensor& gate_scale,
+                           torch::Tensor& topk_index, torch::Tensor& gate_index,
                            torch::Tensor& token_offs_pad,
                            torch::Tensor& block_pid_map,
                            torch::Tensor& expt_offs, torch::Tensor& hist) {
@@ -379,13 +690,13 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     constexpr int NUM_BLOCK_SIZES = 4;
     const auto num_experts = gating_output.size(-1);
     const auto num_tokens = gating_output.numel() / num_experts;
-    #if KERNEL_DEBUG
+#if KERNEL_DEBUG
     std::cout << "=== fused_routing called ===" << std::endl;
     std::cout << "  num_tokens: " << num_tokens << std::endl;
     std::cout << "  num_experts: " << num_experts << std::endl;
     std::cout << "  max_n_tiles: " << max_n_tiles << std::endl;
     std::cout << "  topk: " << topk << std::endl;
-    #endif
+#endif
 
     switch (num_experts) {
         case 32: {
@@ -404,9 +715,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size =
                 topk * rows_per_cta;  // Use actual rows_per_cta
-            auto kernel_wrapper =
-                &(vllm::moe::fused_routing_kernel<32, const_topk,
-                                                  NUM_BLOCK_SIZES, InValType, OutValType>);
+            auto kernel_wrapper = &(
+                vllm::moe::fused_routing_kernel<32, const_topk, NUM_BLOCK_SIZES,
+                                                InValType, OutValType>);
 
             cudaFuncAttributes attr;
             cudaLaunchConfig_t config = {};
@@ -475,7 +786,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             local_offset_size = topk * rows_per_cta;  // Use actual rows_per_cta
             // try to fix shared memory size
             // config.dynamicSmemBytes =
-            //     (global_hist_size + local_hist_size + global_hist_prefix_size +
+            //     (global_hist_size + local_hist_size + global_hist_prefix_size
+            //     +
             //      token_offs_pad_size + block_pid_size + prefix_experts_size +
             //      local_offset_size) *
             //     sizeof(int32_t);
@@ -488,7 +800,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             attribute[0].val.clusterDim.z = 1;
             config.attrs = attribute;
             config.numAttrs = 1;
-            const cudaStream_t current_stream = at::cuda::getCurrentCUDAStream();
+            const cudaStream_t current_stream =
+                at::cuda::getCurrentCUDAStream();
             config.stream = current_stream;
 
             auto topk_weights_ptr =
