@@ -824,6 +824,131 @@ void routing_kernel_helper(torch::Tensor& gating_output,
 
             break;
         }
+        case 128: {
+            auto warp_size = 32;
+            int cluster_size = 0;
+            int THREAD_PER_CTA = 512;
+
+            int hypo_cluster_size = 8;
+            size_t rows_per_cta =
+                (num_tokens + hypo_cluster_size - 1) / hypo_cluster_size;
+            size_t global_hist_size = num_experts;
+            size_t local_hist_size = num_experts;
+            size_t global_hist_prefix_size = num_experts + 1;
+            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
+            size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
+            size_t prefix_experts_size = num_experts;
+            size_t local_offset_size =
+                topk * rows_per_cta;  // Use actual rows_per_cta
+            auto kernel_wrapper =
+                &(vllm::moe::fused_routing_kernel<
+                    128, const_topk, NUM_BLOCK_SIZES, InValType, OutValType>);
+
+            cudaFuncAttributes attr;
+            cudaLaunchConfig_t config = {};
+            // query static allocated sm size
+            auto cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
+            size_t static_smem_size = attr.sharedSizeBytes;
+            size_t required_dynamicSmemBytes =
+                (global_hist_size + local_hist_size + global_hist_prefix_size +
+                 token_offs_pad_size + block_pid_size + prefix_experts_size +
+                 local_offset_size) *
+                sizeof(int32_t);
+            size_t requried_sm_size =
+                static_smem_size + required_dynamicSmemBytes;
+            config.dynamicSmemBytes = required_dynamicSmemBytes + 1024;
+
+            // dev id
+            int dev_id = 0;
+            cuda_error = cudaGetDevice(&dev_id);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
+
+            // max sm size
+            int max_hw_limit = 0;
+            cuda_error = cudaDeviceGetAttribute(
+                &max_hw_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id);
+            TORCH_CHECK(requried_sm_size <= max_hw_limit,
+                        cudaGetErrorString(cuda_error));
+
+            cuda_error = cudaFuncSetAttribute(
+                kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                config.dynamicSmemBytes);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+
+            cuda_error = cudaFuncSetAttribute(
+                kernel_wrapper, cudaFuncAttributeNonPortableClusterSizeAllowed,
+                1);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+
+            cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+            cuda_error = cudaOccupancyMaxPotentialClusterSize(
+                &cluster_size, kernel_wrapper, &config);
+            TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+#if KERNEL_DEBUG
+            std::cout << "  binaryVersion: " << attr.binaryVersion
+                      << std::endl;  // 应该是 90 for sm_90
+            std::cout << "  maxDynamicSharedSizeBytes: "
+                      << attr.maxDynamicSharedSizeBytes << std::endl;
+            std::cout << "  sharedSizeBytes: " << attr.sharedSizeBytes
+                      << std::endl;
+            std::cout << "cluster size: " << cluster_size << std::endl;
+            std::cout << "Req Smem: " << config.dynamicSmemBytes / 1024.f
+                      << " Kbytes" << std::endl;
+            if (cluster_size < hypo_cluster_size) {
+                std::cout << "cluster size error" << cluster_size << std::endl;
+            }
+#endif
+
+            cluster_size = hypo_cluster_size;
+            auto grid_dim = dim3(cluster_size, 1, 1);
+            config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
+            config.gridDim = grid_dim;
+
+            // recompute SM
+            rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
+            local_offset_size = topk * rows_per_cta;  // Use actual rows_per_cta
+            // try to fix shared memory size
+            // config.dynamicSmemBytes =
+            //     (global_hist_size + local_hist_size + global_hist_prefix_size
+            //     +
+            //      token_offs_pad_size + block_pid_size + prefix_experts_size +
+            //      local_offset_size) *
+            //     sizeof(int32_t);
+
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeClusterDimension;
+            attribute[0].val.clusterDim.x =
+                grid_dim.x;  // Cluster size in X-dimension
+            attribute[0].val.clusterDim.y = 1;
+            attribute[0].val.clusterDim.z = 1;
+            config.attrs = attribute;
+            config.numAttrs = 1;
+            const cudaStream_t current_stream =
+                at::cuda::getCurrentCUDAStream();
+            config.stream = current_stream;
+
+            auto topk_weights_ptr =
+                reinterpret_cast<InValType*>(topk_weights.data_ptr());
+            auto gate_scale_ptr =
+                reinterpret_cast<OutValType*>(gate_scale.data_ptr());
+            auto topk_indices_ptr = topk_indices.data_ptr<IdxType>();
+            auto topk_index_ptr = topk_index.data_ptr<int32_t>();
+            auto gate_index_ptr = gate_index.data_ptr<int32_t>();
+            auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
+            auto block_pid_map_ptr = block_pid_map.data_ptr<int32_t>();
+            auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
+            auto hist_ptr = hist.data_ptr<int32_t>();
+
+            cudaLaunchKernelEx(&config, kernel_wrapper, topk_weights_ptr,
+                               topk_indices_ptr, max_n_tiles, num_tokens,
+                               gate_scale_ptr, topk_index_ptr, gate_index_ptr,
+                               token_offs_pad_ptr, block_pid_map_ptr,
+                               expt_offs_ptr, hist_ptr);
+
+            break;
+        }
             TORCH_CHECK(false, "Unsupported num experts: ", num_experts);
     }
 }
