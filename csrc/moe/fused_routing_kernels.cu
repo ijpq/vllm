@@ -73,12 +73,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     [ROWS_PER_CTA*topk]: local_offset
     */
     using BlockScan = cub::BlockScan<int, 512>;
-    // using WarpScan = cub::WarpScan<int>;
     __shared__ typename BlockScan::TempStorage temp_storage_hist;
     __shared__
         typename BlockScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
-    // __shared__
-    //     typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ int32_t sm_hist[];
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
@@ -92,14 +89,12 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
 
-    // Step 1: Zero-initialize entire shared memory
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
         sm_hist[i] = 0;
     }
     __syncthreads();  // Ensure all threads complete zeroing before setting -1
 
-    // Step 2: Set block_pid_map region to -1
 #pragma unroll
     for (int i = local_tid; i < NUM_BLOCK_SIZES * (max_n_tiles);
          i += blockDim.x) {
@@ -133,9 +128,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             // expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
             // expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
         }
-        // Bounds check - clamp expert indices to valid range [0, NUM_EXPERTS-1]
-        // This prevents shared memory out-of-bounds access during CUDA graph
-        // capture when topk_indices may contain uninitialized/garbage values
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
             local_offset_sm[local_i * topk_padded] =
@@ -182,7 +174,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int h = 0;
     int lane_id = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    // int hist_idx = warp_id * warp_size + lane_id;
     if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
         int32_t* global_hist_sm0 =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
@@ -281,9 +272,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = topk_indices[i * topk_idx_stride + k];
-                // Bounds check - clamp expert indices to valid range [0,
-                // NUM_EXPERTS-1] This prevents shared memory out-of-bounds
-                // access during CUDA graph capture
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = topk_weights[i * topk_val_stride + k];
                     int flat_idx = i * topk + k;
@@ -361,14 +349,12 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int shared_mem_size = local_offset_offset + topk_padded * ROWS_PER_CTA;
 
-    // Step 1: Zero-initialize entire shared memory
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
         sm_hist[i] = 0;
     }
-    __syncthreads();  // Ensure all threads complete zeroing before setting -1
+    __syncthreads();
 
-    // Step 2: Set block_pid_map region to -1
 #pragma unroll
     for (int i = local_tid; i < NUM_BLOCK_SIZES * (max_n_tiles);
          i += blockDim.x) {
@@ -401,9 +387,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             // expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
             // expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
         }
-        // Bounds check - clamp expert indices to valid range [0, NUM_EXPERTS-1]
-        // This prevents shared memory out-of-bounds access during CUDA graph
-        // capture when topk_indices may contain uninitialized/garbage values
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
             local_offset_sm[local_i * topk_padded] =
@@ -484,7 +467,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         if (lane_id == 0)
             token_offs_pad[warp_id * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
                 warp_reduce;
-        // __syncwarp(); // since the last pos won't be read in this loop.
 
         int tile_start = exclusive_res;
         for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
@@ -544,9 +526,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = topk_indices[i * topk_idx_stride + k];
-                // Bounds check - clamp expert indices to valid range [0,
-                // NUM_EXPERTS-1] This prevents shared memory out-of-bounds
-                // access during CUDA graph capture
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = topk_weights[i * topk_val_stride + k];
                     int flat_idx = i * topk + k;
@@ -612,15 +591,13 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
-            size_t local_offset_size =
-                const_topk_padded * rows_per_cta;  // Use actual rows_per_cta
+            size_t local_offset_size = const_topk_padded * rows_per_cta;
             auto kernel_wrapper = &(
                 vllm::moe::fused_routing_kernel<32, const_topk, NUM_BLOCK_SIZES,
                                                 InValType, OutValType>);
 
             cudaFuncAttributes attr;
             cudaLaunchConfig_t config = {};
-            // query static allocated sm size
             auto cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
             TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
             size_t static_smem_size = attr.sharedSizeBytes;
@@ -679,21 +656,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
 
-            // recompute SM
-            // rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-            // local_offset_size = topk * rows_per_cta;  // Use actual
-            // rows_per_cta try to fix shared memory size
-            // config.dynamicSmemBytes =
-            //     (global_hist_size + local_hist_size + global_hist_prefix_size
-            //     +
-            //      token_offs_pad_size + block_pid_size + prefix_experts_size +
-            //      local_offset_size) *
-            //     sizeof(int32_t);
-
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeClusterDimension;
-            attribute[0].val.clusterDim.x =
-                grid_dim.x;  // Cluster size in X-dimension
+            attribute[0].val.clusterDim.x = grid_dim.x;
             attribute[0].val.clusterDim.y = 1;
             attribute[0].val.clusterDim.z = 1;
             config.attrs = attribute;
@@ -736,15 +701,13 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
-            size_t local_offset_size =
-                const_topk_padded * rows_per_cta;  // Use actual rows_per_cta
+            size_t local_offset_size = const_topk_padded * rows_per_cta;
             auto kernel_wrapper =
                 &(vllm::moe::fused_routing_kernel<
                     128, const_topk, NUM_BLOCK_SIZES, InValType, OutValType>);
 
             cudaFuncAttributes attr;
             cudaLaunchConfig_t config = {};
-            // query static allocated sm size
             auto cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
             TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
             size_t static_smem_size = attr.sharedSizeBytes;
@@ -802,17 +765,6 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto grid_dim = dim3(cluster_size, 1, 1);
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
-
-            // recompute SM
-            // rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-            // local_offset_size = topk * rows_per_cta;  // Use actual
-            // rows_per_cta try to fix shared memory size
-            // config.dynamicSmemBytes =
-            //     (global_hist_size + local_hist_size + global_hist_prefix_size
-            //     +
-            //      token_offs_pad_size + block_pid_size + prefix_experts_size +
-            //      local_offset_size) *
-            //     sizeof(int32_t);
 
             cudaLaunchAttribute attribute[1];
             attribute[0].id = cudaLaunchAttributeClusterDimension;
