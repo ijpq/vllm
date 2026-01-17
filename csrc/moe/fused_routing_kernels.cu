@@ -21,23 +21,27 @@ namespace moe {
 
 #define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
 
-__forceinline__ __device__
-collect_hist(cooperative_groups::cluster_group& handle, int num_experts,
+ __device__
+void collect_hist(typename cooperative_groups::cluster_group& handle, int num_experts,
              int32_t* __restrict__ hist, int32_t* __restrict__ global_hist) {
-    auto cta_rank = blockIdx.x;
-    auto cluster_size = gridDim.x;
+    handle.sync();
+    auto cta_rank = handle.block_rank();
+    auto cluster_size = handle.num_blocks();
     auto tid = threadIdx.x;
     for (int stride = 1; stride <= cluster_size / 2; stride *= 2) {
         if (cta_rank % (stride * 2) == 0) {
             auto partner_cta = cta_rank + stride;
-            int32_t* partner_hist = handle.map_shared_rank(hist, partner_cta);
-            if (tid < num_experts) {
-                hist[tid] += partner_hist[tid];
+            if (partner_cta < cluster_size) {
+                int32_t* partner_hist = handle.map_shared_rank(hist, partner_cta);
+                if (tid < num_experts) {
+                    hist[tid] += partner_hist[tid];
+                }
             }
         }
         handle.sync();
     }
     if (cta_rank == 0 && tid < num_experts) global_hist[tid] = hist[tid];
+    handle.sync();
 }
 
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype,
@@ -162,12 +166,14 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 atomicAdd(local_hist + expt3, 1);
     }
     cluster.sync();
-    int32_t* global_hist =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    collect_hist(cluster, NUM_EXPERTS, local_hist, global_hist);
-    // if (local_tid < NUM_EXPERTS) {
-    //     atomicAdd(global_hist + local_tid, local_hist[local_tid]);
-    // }
+    // int32_t* global_hist =
+    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+    // collect_hist(cluster, NUM_EXPERTS, local_hist, global_hist);
+    int32_t* global_hist = cluster.map_shared_rank(
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset), 0);
+    if (local_tid < NUM_EXPERTS) {
+        atomicAdd(global_hist + local_tid, local_hist[local_tid]);
+    }
     cluster.sync();
 
     /* phase 2*/
@@ -421,13 +427,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             local_offset_sm[local_i * topk_padded + 3] =
                 atomicAdd(local_hist + expt3, 1);
     }
-    cluster.sync();
-    int32_t* global_hist = cluster.map_shared_rank(
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset), 0);
-    if (local_tid < NUM_EXPERTS) {
-        atomicAdd(global_hist + local_tid, local_hist[local_tid]);
-    }
-    cluster.sync();
+    int32_t* global_hist = 
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+    collect_hist(cluster, NUM_EXPERTS, local_hist, global_hist);
 
     /* phase 2*/
     int warp_id = threadIdx.x / 32;
