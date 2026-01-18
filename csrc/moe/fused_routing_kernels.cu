@@ -25,7 +25,6 @@ template <int NUM_EXPERTS>
 __forceinline__ __device__ void collect_hist(
     typename cooperative_groups::cluster_group& handle,
     int32_t* __restrict__ hist, int32_t* __restrict__ global_hist) {
-    handle.sync();
     auto cta_rank = handle.block_rank();
     auto cluster_size = handle.num_blocks();
     auto tid = threadIdx.x;
@@ -48,7 +47,28 @@ __forceinline__ __device__ void collect_hist(
     }
     if (cta_rank == 0 && tid < NUM_EXPERTS) global_hist[tid] = hist[tid];
     if (tid < NUM_EXPERTS) hist[tid] = hist_buffer[tid];  // restore
-    handle.sync();
+}
+
+template <int NUM_EXPERTS>
+__forceinline__ __device__ void prefix_hist_CTA(
+    cooperative_groups::cluster_group& handle, int32_t* __restrict__ hist,
+    int32_t* __restrict__ prefix) {
+    auto cta_rank = handle.block_rank();
+    auto cluster_size = handle.num_blocks();
+    auto tid = threadIdx.x;
+    if (cta_rank > 0 && tid < NUM_EXPERTS) {
+        int32_t* prev_hist = handle.map_shared_rank(hist, cta_rank - 1);
+        prefix[tid] = prev_hist[tid];
+    }
+
+    handle.sync();  // ensure prefix has been initialized.
+    if (cta_rank == 0) {
+        for (auto rank = 2; rank < cluster_size; rank++) {
+            auto prev_prefix = handle.map_shared_rank(prefix, rank - 1);
+            auto dst_prefix = handle.map_shared_rank(prefix, rank);
+            if (tid < NUM_EXPERTS) dst_prefix[tid] += prev_prefix[tid];
+        }
+    }
 }
 
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype,
@@ -172,30 +192,17 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             local_offset_sm[local_i * topk_padded + 3] =
                 atomicAdd(local_hist + expt3, 1);
     }
+    cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
     collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
-
     /* phase 2*/
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // TODO(ijpq): we can leverage warpscan to improve this process, but need
     // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
-    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
-        for (int bidx = 1; bidx < gridDim.x; bidx++) {
-            int32_t* dst_experts = cluster.map_shared_rank(
-                reinterpret_cast<int32_t*>(sm_hist + expert_across_offset),
-                bidx);
-            int32_t* tb_local_hist = cluster.map_shared_rank(
-                reinterpret_cast<int32_t*>(sm_hist + local_hist_offset),
-                bidx - 1);
-            int32_t* accum_hist = cluster.map_shared_rank(
-                reinterpret_cast<int32_t*>(sm_hist + expert_across_offset),
-                bidx - 1);
-            dst_experts[local_tid] =
-                tb_local_hist[local_tid] + accum_hist[local_tid];
-        }
-    }
+    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
+                                 sm_hist + expert_across_offset);
     cluster.sync();
     int h = 0;
     int lane_id = threadIdx.x % 32;
@@ -427,6 +434,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             local_offset_sm[local_i * topk_padded + 3] =
                 atomicAdd(local_hist + expt3, 1);
     }
+    cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
     collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
@@ -437,21 +445,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // TODO(ijpq): we can leverage warpscan to improve this process, but need
     // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
-    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
-        for (int bidx = 1; bidx < gridDim.x; bidx++) {
-            int32_t* dst_experts = cluster.map_shared_rank(
-                reinterpret_cast<int32_t*>(sm_hist + expert_across_offset),
-                bidx);
-            int32_t* tb_local_hist = cluster.map_shared_rank(
-                reinterpret_cast<int32_t*>(sm_hist + local_hist_offset),
-                bidx - 1);
-            int32_t* accum_hist = cluster.map_shared_rank(
-                reinterpret_cast<int32_t*>(sm_hist + expert_across_offset),
-                bidx - 1);
-            dst_experts[local_tid] =
-                tb_local_hist[local_tid] + accum_hist[local_tid];
-        }
-    }
+    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
+                                 sm_hist + expert_across_offset);
     cluster.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
         int32_t* global_hist_sm0 =
