@@ -21,6 +21,43 @@ namespace moe {
 
 #define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
 
+__device__ int swizzle_addr(int row, int col) {
+    constexpr int COLS = 4;  // topk
+    int elem_idx = row * COLS + col;
+
+    int block = elem_idx / 32;
+
+    int offset = elem_idx % 32;
+
+    int swizzled_offset = offset ^ ((block * COLS) & 0x1F);
+
+    return block * 32 + swizzled_offset;
+}
+
+namespace fused_routing {
+__device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
+                                                 const void* glob_ptr,
+                                                 bool pred = true) {
+    const int BYTES = 16;
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "{\n"
+        "   .reg .pred p;\n"
+        "   setp.ne.b32 p, %0, 0;\n"
+        "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+        "}\n" ::"r"((int)pred),
+        "r"(smem), "l"(glob_ptr), "n"(BYTES));
+}
+
+__device__ inline void cp_async_fence() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int n>
+__device__ inline void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void collect_hist(
     typename cooperative_groups::cluster_group& handle,
@@ -70,6 +107,7 @@ __forceinline__ __device__ void prefix_hist_CTA(
         }
     }
 }
+}  // namespace fused_routing
 
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype,
           typename OutValDtype>
@@ -126,6 +164,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     __shared__ typename BlockScan::TempStorage temp_storage_hist;
     __shared__
         typename BlockScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
+    __shared__ InValDtype sm_topk_weights[ROWS_PER_CTA * topk_padded];
     extern __shared__ int32_t sm_hist[];
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
@@ -195,14 +234,14 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
+    fused_routing::collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
     /* phase 2*/
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // TODO(ijpq): we can leverage warpscan to improve this process, but need
     // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
-    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
-                                 sm_hist + expert_across_offset);
+    fused_routing::prefix_hist_CTA<NUM_EXPERTS>(
+        cluster, sm_hist + local_hist_offset, sm_hist + expert_across_offset);
     cluster.sync();
     int h = 0;
     int lane_id = threadIdx.x % 32;
@@ -380,7 +419,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int expert_across_offset =
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
-    int shared_mem_size = local_offset_offset + topk_padded * ROWS_PER_CTA;
+    // int shared_mem_size = local_offset_offset + topk_padded * ROWS_PER_CTA;
+    int shared_mem_size = local_offset_offset + topk * ROWS_PER_CTA;
 
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
@@ -422,22 +462,30 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded] =
+            // local_offset_sm[local_i * topk_padded] =
+            //     atomicAdd(local_hist + expt0, 1);
+            local_offset_sm[swizzle_addr(local_i, 0)] =
                 atomicAdd(local_hist + expt0, 1);
         if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded + 1] =
+            // local_offset_sm[local_i * topk_padded + 1] =
+            //     atomicAdd(local_hist + expt1, 1);
+            local_offset_sm[swizzle_addr(local_i, 1)] =
                 atomicAdd(local_hist + expt1, 1);
         if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded + 2] =
+            // local_offset_sm[local_i * topk_padded + 2] =
+            //     atomicAdd(local_hist + expt2, 1);
+            local_offset_sm[swizzle_addr(local_i, 2)] =
                 atomicAdd(local_hist + expt2, 1);
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded + 3] =
+            // local_offset_sm[local_i * topk_padded + 3] =
+            //     atomicAdd(local_hist + expt3, 1);
+            local_offset_sm[swizzle_addr(local_i, 3)] =
                 atomicAdd(local_hist + expt3, 1);
     }
     cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
+    fused_routing::collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
 
     /* phase 2*/
     int warp_id = threadIdx.x / 32;
@@ -445,8 +493,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // TODO(ijpq): we can leverage warpscan to improve this process, but need
     // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
-    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
-                                 sm_hist + expert_across_offset);
+    fused_routing::prefix_hist_CTA<NUM_EXPERTS>(
+        cluster, sm_hist + local_hist_offset, sm_hist + expert_across_offset);
     cluster.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
         int32_t* global_hist_sm0 =
@@ -549,7 +597,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
                     int expert_local =
-                        local_offset_sm[local_i * topk_padded + k];
+                        // local_offset_sm[local_i * topk_padded + k];
+                        local_offset_sm[swizzle_addr(local_i, k)];
                     int global_pos = expert_base + expert_prior + expert_local;
 
                     if (global_pos < NUM_TOKENS * topk &&
