@@ -19,7 +19,7 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
 
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void collect_hist(
@@ -599,6 +599,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             int cluster_size = 0;
             int THREAD_PER_CTA = 512;
 
+            // hypothetical config
             int hypo_cluster_size = 8;
             size_t rows_per_cta =
                 (num_tokens + hypo_cluster_size - 1) / hypo_cluster_size;
@@ -667,9 +668,26 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 std::cout << "cluster size error" << cluster_size << std::endl;
             }
 #endif
+            auto grid_dim = dim3(hypo_cluster_size, 1, 1);
+            // recompute config
+            if (cluster_size > hypo_cluster_size) {
+                size_t rows_per_cta =
+                    (num_tokens + cluster_size - 1) / cluster_size;
+                local_offset_size = const_topk_padded * rows_per_cta;
+                required_dynamicSmemBytes =
+                    (global_hist_size + local_hist_size +
+                     global_hist_prefix_size + token_offs_pad_size +
+                     block_pid_size + prefix_experts_size + local_offset_size) *
+                    sizeof(int32_t);
 
-            cluster_size = hypo_cluster_size;
-            auto grid_dim = dim3(cluster_size, 1, 1);
+                requried_sm_size = static_smem_size + required_dynamicSmemBytes;
+                config.dynamicSmemBytes = required_dynamicSmemBytes + 1024;
+                cuda_error = cudaFuncSetAttribute(
+                    kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    config.dynamicSmemBytes);
+                TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+                grid_dim = dim3(cluster_size, 1, 1);
+            }
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
 
@@ -777,9 +795,27 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 std::cout << "cluster size error" << cluster_size << std::endl;
             }
 #endif
+            auto grid_dim = dim3(hypo_cluster_size, 1, 1);
+            // recompute config
+            if (cluster_size > hypo_cluster_size) {
+                size_t rows_per_cta =
+                    (num_tokens + cluster_size - 1) / cluster_size;
+                local_offset_size = const_topk_padded * rows_per_cta;
+                required_dynamicSmemBytes =
+                    (global_hist_size + local_hist_size +
+                     global_hist_prefix_size + token_offs_pad_size +
+                     block_pid_size + prefix_experts_size + local_offset_size) *
+                    sizeof(int32_t);
 
-            cluster_size = hypo_cluster_size;
-            auto grid_dim = dim3(cluster_size, 1, 1);
+                requried_sm_size = static_smem_size + required_dynamicSmemBytes;
+                config.dynamicSmemBytes = required_dynamicSmemBytes + 1024;
+                cuda_error = cudaFuncSetAttribute(
+                    kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    config.dynamicSmemBytes);
+                TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+                grid_dim = dim3(cluster_size, 1, 1);
+            }
+
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
 
