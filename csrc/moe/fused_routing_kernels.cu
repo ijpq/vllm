@@ -164,7 +164,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     __shared__ typename BlockScan::TempStorage temp_storage_hist;
     __shared__
         typename BlockScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
-    __shared__ InValDtype sm_topk_weights[ROWS_PER_CTA * topk_padded];
+    // __shared__ InValDtype sm_topk_weights[ROWS_PER_CTA * topk_padded];
     extern __shared__ int32_t sm_hist[];
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
@@ -219,17 +219,25 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded] =
-                atomicAdd(local_hist + expt0, 1);
+            // local_offset_sm[local_i * topk_padded] =
+            //     atomicAdd(local_hist + expt0, 1);
+	local_offset_sm[
+		swizzle_addr(local_i, 0)] = atomicAdd(local_hist + expt0, 1);
         if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded + 1] =
-                atomicAdd(local_hist + expt1, 1);
+	local_offset_sm[
+		swizzle_addr(local_i, 1)] = atomicAdd(local_hist + expt1, 1);
+            // local_offset_sm[local_i * topk_padded + 1] =
+            //     atomicAdd(local_hist + expt1, 1);
         if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded + 2] =
-                atomicAdd(local_hist + expt2, 1);
+	local_offset_sm[
+		swizzle_addr(local_i, 2)] = atomicAdd(local_hist + expt2, 1);
+            // local_offset_sm[local_i * topk_padded + 2] =
+            //     atomicAdd(local_hist + expt2, 1);
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-            local_offset_sm[local_i * topk_padded + 3] =
-                atomicAdd(local_hist + expt3, 1);
+	local_offset_sm[
+		swizzle_addr(local_i, 3)] = atomicAdd(local_hist + expt3, 1);
+            // local_offset_sm[local_i * topk_padded + 3] =
+            //     atomicAdd(local_hist + expt3, 1);
     }
     cluster.sync();
     int32_t* global_hist =
@@ -349,8 +357,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
-                    int expert_local =
-                        local_offset_sm[local_i * topk_padded + k];
+                    int expert_local = local_offset_sm[swizzle_addr(local_i, k)];
+                        // local_offset_sm[local_i * topk_padded + k];
+			
                     int global_pos = expert_base + expert_prior + expert_local;
 
                     if (global_pos < NUM_TOKENS * topk &&
