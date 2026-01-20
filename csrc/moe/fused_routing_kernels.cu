@@ -19,17 +19,17 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
 
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
     int elem_idx = row * COLS + col;
 
-    int block = elem_idx / 32;
+    int block = elem_idx >> 5;
 
-    int offset = elem_idx % 32;
+    int bank = elem_idx % 32;
 
-    int swizzled_offset = offset ^ ((block * COLS) & 0x1F);
+    int swizzled_offset = bank ^ block;
 
     return block * 32 + swizzled_offset;
 }
@@ -212,32 +212,20 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             expt1 = expts.y;
             expt2 = expts.z;
             expt3 = expts.w;
-            // expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
-            // expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
-            // expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
-            // expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
         }
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            // local_offset_sm[local_i * topk_padded] =
-            //     atomicAdd(local_hist + expt0, 1);
-	local_offset_sm[
-		swizzle_addr(local_i, 0)] = atomicAdd(local_hist + expt0, 1);
+            local_offset_sm[swizzle_addr(local_i, 0)] =
+                atomicAdd(local_hist + expt0, 1);
         if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-	local_offset_sm[
-		swizzle_addr(local_i, 1)] = atomicAdd(local_hist + expt1, 1);
-            // local_offset_sm[local_i * topk_padded + 1] =
-            //     atomicAdd(local_hist + expt1, 1);
+            local_offset_sm[swizzle_addr(local_i, 1)] =
+                atomicAdd(local_hist + expt1, 1);
         if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-	local_offset_sm[
-		swizzle_addr(local_i, 2)] = atomicAdd(local_hist + expt2, 1);
-            // local_offset_sm[local_i * topk_padded + 2] =
-            //     atomicAdd(local_hist + expt2, 1);
+            local_offset_sm[swizzle_addr(local_i, 2)] =
+                atomicAdd(local_hist + expt2, 1);
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-	local_offset_sm[
-		swizzle_addr(local_i, 3)] = atomicAdd(local_hist + expt3, 1);
-            // local_offset_sm[local_i * topk_padded + 3] =
-            //     atomicAdd(local_hist + expt3, 1);
+            local_offset_sm[swizzle_addr(local_i, 3)] =
+                atomicAdd(local_hist + expt3, 1);
     }
     cluster.sync();
     int32_t* global_hist =
@@ -357,9 +345,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
-                    int expert_local = local_offset_sm[swizzle_addr(local_i, k)];
-                        // local_offset_sm[local_i * topk_padded + k];
-			
+                    int expert_local =
+                        local_offset_sm[swizzle_addr(local_i, k)];
+
                     int global_pos = expert_base + expert_prior + expert_local;
 
                     if (global_pos < NUM_TOKENS * topk &&
@@ -464,30 +452,18 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             expt1 = expts.y;
             expt2 = expts.z;
             expt3 = expts.w;
-            // expt0 = static_cast<int32_t>(topk_indices[i * topk + 0]);
-            // expt1 = static_cast<int32_t>(topk_indices[i * topk + 1]);
-            // expt2 = static_cast<int32_t>(topk_indices[i * topk + 2]);
-            // expt3 = static_cast<int32_t>(topk_indices[i * topk + 3]);
         }
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            // local_offset_sm[local_i * topk_padded] =
-            //     atomicAdd(local_hist + expt0, 1);
             local_offset_sm[swizzle_addr(local_i, 0)] =
                 atomicAdd(local_hist + expt0, 1);
         if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-            // local_offset_sm[local_i * topk_padded + 1] =
-            //     atomicAdd(local_hist + expt1, 1);
             local_offset_sm[swizzle_addr(local_i, 1)] =
                 atomicAdd(local_hist + expt1, 1);
         if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-            // local_offset_sm[local_i * topk_padded + 2] =
-            //     atomicAdd(local_hist + expt2, 1);
             local_offset_sm[swizzle_addr(local_i, 2)] =
                 atomicAdd(local_hist + expt2, 1);
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-            // local_offset_sm[local_i * topk_padded + 3] =
-            //     atomicAdd(local_hist + expt3, 1);
             local_offset_sm[swizzle_addr(local_i, 3)] =
                 atomicAdd(local_hist + expt3, 1);
     }
@@ -606,7 +582,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
                     int expert_local =
-                        // local_offset_sm[local_i * topk_padded + k];
                         local_offset_sm[swizzle_addr(local_i, k)];
                     int global_pos = expert_base + expert_prior + expert_local;
 
@@ -639,7 +614,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     */
     TORCH_CHECK(topk == 4, "");
     constexpr int const_topk = 4;
-    constexpr int const_topk_padded = const_topk + 1;
+    constexpr int const_topk_padded = const_topk;  // since we've had swizzle
     constexpr int NUM_BLOCK_SIZES = 4;
     const auto num_experts = gating_output.size(-1);
     const auto num_tokens = gating_output.numel() / num_experts;
