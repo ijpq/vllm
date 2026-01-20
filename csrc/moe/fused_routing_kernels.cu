@@ -19,7 +19,7 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
 
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
@@ -158,6 +158,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     [NUM_BLOCK_SIZES, max_n_tiles] : block_pid
     [NUM_EXPERTS]: exclusivesum for experts
     [ROWS_PER_CTA*topk]: local_offset
+    [2 * ROWS_PER_CTA * topk * sizeof(InValDtype)] : topk_weights
+    [2 * ROWS_PER_CTA * topk ] : topk_indices
+
     */
     using BlockScan = cub::BlockScan<int, 512>;
     __shared__ typename BlockScan::TempStorage temp_storage_hist;
@@ -176,7 +179,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int topk_weights_offset = local_offset_offset + topk * ROWS_PER_CTA;
-    int topk_indices_offset = topk_weights_offset + 2 * topk * ROWS_PER_CTA;
+    int topk_indices_offset =
+        topk_weights_offset +
+        2 * topk * ROWS_PER_CTA * (sizeof(InValDtype) / sizeof(int32_t));
     int shared_mem_size = topk_indices_offset + 2 * topk * ROWS_PER_CTA;
 
 #pragma unroll
@@ -335,18 +340,21 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
 
     int current_stage = 0;
-    int topk_weights_sm_size = topk * ROWS_PER_CTA;
+    int topk_weights_sm_size =
+        topk * ROWS_PER_CTA * sizeof(InValDtype) / sizeof(int32_t);
+    int topk_indices_sm_size = topk * ROWS_PER_CTA;
 // prefetch
 #pragma unroll
-    for (int i = row + local_tid; i < row_end;) {
+    if (row + local_tid < row_end) {
+        if ((local_tid & 1) == 0)
+            fused_routing::cp_async_cg_pred(
+                (sm_hist + topk_weights_offset +
+                 current_stage * topk_weights_sm_size + (local_tid * topk)),
+                topk_weights + (row + local_tid) * topk);
         fused_routing::cp_async_cg_pred(
-            (sm_hist + topk_weights_offset + (local_tid * topk) +
-             current_stage * topk_weights_sm_size),
-            topk_weights + i * topk, lane_id < 16);
-        fused_routing::cp_async_cg_pred(
-            sm_hist + topk_indices_offset + local_tid * topk +
-                current_stage * topk_weights_sm_size,
-            topk_indices + i * topk);
+            sm_hist + topk_indices_offset +
+                current_stage * topk_indices_sm_size + local_tid * topk,
+            topk_indices + (row + local_tid) * topk);
     }
     fused_routing::cp_async_fence();
 #pragma unroll
@@ -356,13 +364,14 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         int next_stage = current_stage ^ 1;
         int next_i = i + blockDim.x;
         if (next_i < row_end) {
+            if ((local_tid & 1) == 0)
+                fused_routing::cp_async_cg_pred(
+                    sm_hist + topk_weights_offset +
+                        next_stage * topk_weights_sm_size + (local_tid * topk),
+                    topk_weights + (next_i * topk));
             fused_routing::cp_async_cg_pred(
-                sm_hist + topk_weights_offset + (local_tid * topk) +
-                    next_stage * topk_weights_sm_size,
-                topk_weights + (next_i * topk), lane_id < 16);
-            fused_routing::cp_async_cg_pred(
-                sm_hist + topk_indices_offset + local_tid * topk +
-                    next_stage * topk_weights_sm_size,
+                sm_hist + topk_indices_offset +
+                    next_stage * topk_indices_sm_size + local_tid * topk,
                 topk_indices + next_i * topk);
             fused_routing::cp_async_fence();
         }
@@ -372,14 +381,15 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
                     sm_hist + topk_indices_offset +
-                    current_stage * topk_weights_sm_size +
+                    current_stage * topk_indices_sm_size +
                     local_tid * topk_idx_stride + k);
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     // InValDtype val = *reinterpret_cast<InValDtype*>(
                     //     topk_weights + i * topk_val_stride + k);
-                    auto val = *(sm_hist + topk_weights_offset +
-                                 current_stage * topk_weights_sm_size +
-                                 local_i * topk + k);
+                    auto val = *reinterpret_cast<InValDtype*>(
+                        sm_hist + topk_weights_offset +
+                        current_stage * topk_weights_sm_size + local_i * topk +
+                        k);
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
