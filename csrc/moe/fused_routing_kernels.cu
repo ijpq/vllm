@@ -363,12 +363,17 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
     int current_stage = 0;
     // prefetch
-    int32_t* topk_weights_sm = sm_hist + topk_weights_offset;
-    int32_t* topk_indices_sm = sm_hist + topk_indices_offset;
+    int weights_row_size_int32 =
+        topk * sizeof(InValDtype) / sizeof(int32_t);  // = 2
+
     if (row + local_tid < row_end) {
-        cp_async_ca_pred(topk_weights_sm + (local_tid * topk),
+        cp_async_ca_pred(sm_hist + topk_weights_offset +
+                             current_stage * topk_weights_sm_size / num_stages +
+                             local_tid * weights_row_size_int32,
                          topk_weights + (row + local_tid) * topk);
-        cp_async_cg_pred(topk_indices_sm + local_tid * topk,
+        cp_async_cg_pred(sm_hist + topk_indices_offset +
+                             current_stage * topk_indices_sm_size / num_stages +
+                             local_tid * topk,
                          topk_indices + (row + local_tid) * topk);
     }
     cp_async_fence();
@@ -379,33 +384,29 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         int next_stage = current_stage ^ 1;
         int next_i = i + blockDim.x;
         if (next_i < row_end) {
-            cp_async_ca_pred(
-                topk_weights_sm +
-                    next_stage * topk_weights_sm_size / num_stages +
-                    (local_tid * topk),
-                topk_weights + (next_i * topk));
             cp_async_cg_pred(
-                topk_indices_sm +
+                sm_hist + topk_indices_offset +
                     next_stage * topk_indices_sm_size / num_stages +
                     local_tid * topk,
                 topk_indices + next_i * topk);
             cp_async_fence();
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
         }
-
-        cp_async_wait<1>();
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
                     sm_hist + topk_indices_offset +
-                    current_stage * topk_indices_sm_size +
+                    current_stage * topk_indices_sm_size / num_stages +
                     local_tid * topk_idx_stride + k);
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     // InValDtype val = *reinterpret_cast<InValDtype*>(
                     //     topk_weights + i * topk_val_stride + k);
                     auto val = reinterpret_cast<InValDtype*>(
                         sm_hist + topk_weights_offset +
-                        current_stage *
-                            topk_weights_sm_size)[local_i * topk + k];
+                        current_stage * topk_weights_sm_size / num_stages +
+                        local_tid * weights_row_size_int32)[k];
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
