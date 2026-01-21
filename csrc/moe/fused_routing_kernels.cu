@@ -25,8 +25,6 @@ namespace moe {
 
 namespace fused_routing {
 
-__constant__ int d_padding_before_weights;
-__constant__ int d_padding_before_indices;
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
     int elem_idx = row * COLS + col;
@@ -131,7 +129,9 @@ __global__ void fused_routing_kernel(
     OutValDtype* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
-    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
+    const int32_t padding_before_weights,
+    const int32_t padding_before_indices) {
     TORCH_CHECK(false, "unimplemented kernel");
 }
 
@@ -143,7 +143,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
-    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
+    const int32_t padding_before_weights,
+    const int32_t padding_before_indices) {
     using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
@@ -201,9 +203,9 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int topk_weights_offset = local_offset_offset + topk_padded * ROWS_PER_CTA +
-                              d_padding_before_weights;
+                              padding_before_weights;
     int topk_indices_offset =
-        topk_weights_offset + topk_weights_sm_size + d_padding_before_indices;
+        topk_weights_offset + topk_weights_sm_size + padding_before_indices;
     int shared_mem_size = topk_indices_offset + topk_indices_sm_size;
 
 #pragma unroll
@@ -439,7 +441,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
-    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+    int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
+    const int32_t padding_before_weights,
+    const int32_t padding_before_indices) {
     using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
@@ -492,9 +496,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int topk_weights_offset = local_offset_offset + topk_padded * ROWS_PER_CTA +
-                              d_padding_before_weights;
+                              padding_before_weights;
     int topk_indices_offset =
-        topk_weights_offset + topk_weights_sm_size + d_padding_before_indices;
+        topk_weights_offset + topk_weights_sm_size + padding_before_indices;
     int shared_mem_size = topk_indices_offset + topk_indices_sm_size;
 
 #pragma unroll
@@ -685,6 +689,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         } else {
             cp_async_wait<0>();
         }
+        __syncwarp();
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
@@ -895,17 +900,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaMemcpyToSymbol(
-                vllm::moe::fused_routing::d_padding_before_weights,
-                &padding_before_weights, sizeof(int32_t));
-            cudaMemcpyToSymbol(
-                vllm::moe::fused_routing::d_padding_before_indices,
-                &padding_before_indices, sizeof(int32_t));
-            cudaLaunchKernelEx(&config, kernel_wrapper, topk_weights_ptr,
-                               topk_indices_ptr, max_n_tiles, num_tokens,
-                               gate_scale_ptr, topk_index_ptr, gate_index_ptr,
-                               token_offs_pad_ptr, block_pid_map_ptr,
-                               expt_offs_ptr, hist_ptr);
+            cudaLaunchKernelEx(
+                &config, kernel_wrapper, topk_weights_ptr, topk_indices_ptr,
+                max_n_tiles, num_tokens, gate_scale_ptr, topk_index_ptr,
+                gate_index_ptr, token_offs_pad_ptr, block_pid_map_ptr,
+                expt_offs_ptr, hist_ptr, (int32_t)padding_before_weights,
+                (int32_t)padding_before_indices);
 
             break;
         }
@@ -1059,18 +1059,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaMemcpyToSymbol(
-                vllm::moe::fused_routing::d_padding_before_weights,
-                &padding_before_weights, sizeof(int32_t));
-            cudaMemcpyToSymbol(
-                vllm::moe::fused_routing::d_padding_before_indices,
-                &padding_before_indices, sizeof(int32_t));
-
-            cudaLaunchKernelEx(&config, kernel_wrapper, topk_weights_ptr,
-                               topk_indices_ptr, max_n_tiles, num_tokens,
-                               gate_scale_ptr, topk_index_ptr, gate_index_ptr,
-                               token_offs_pad_ptr, block_pid_map_ptr,
-                               expt_offs_ptr, hist_ptr);
+            cudaLaunchKernelEx(
+                &config, kernel_wrapper, topk_weights_ptr, topk_indices_ptr,
+                max_n_tiles, num_tokens, gate_scale_ptr, topk_index_ptr,
+                gate_index_ptr, token_offs_pad_ptr, block_pid_map_ptr,
+                expt_offs_ptr, hist_ptr, (int32_t)padding_before_weights,
+                (int32_t)padding_before_indices);
 
             break;
         }
