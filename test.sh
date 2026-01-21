@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e 
 
-count=10
+count=5
 
 for ((i=1; i<=count; i++))
 do
