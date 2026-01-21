@@ -19,10 +19,14 @@ typedef __hip_bfloat162 __nv_bfloat162;
 namespace vllm {
 namespace moe {
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y)-1)) / (y)
+#define FUSED_ROUTING_CEIL_DIV(x, y) (x + ((y) - 1)) / (y)
 
-#define MAKE_ALIGNMENT_DIFF(x, y) ((x + ((y)-1)) / (y) * (y)) - (x)
+#define MAKE_ALIGNMENT_DIFF(x, y) ((x + ((y) - 1)) / (y) * (y)) - (x)
 
+namespace fused_routing {
+
+__constant__ int d_padding_before_weights;
+__constant__ int d_padding_before_indices;
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
     int elem_idx = row * COLS + col;
@@ -35,8 +39,6 @@ __device__ int swizzle_addr(int row, int col) {
 
     return block * 32 + swizzled_offset;
 }
-
-namespace fused_routing {
 __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
                                                  const void* glob_ptr,
                                                  bool pred = true) {
@@ -142,6 +144,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+    using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
     namespace cg = cooperative_groups;
@@ -182,8 +185,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // __shared__ InValDtype sm_topk_weights[ROWS_PER_CTA * topk_padded];
     extern __shared__ int32_t sm_hist[];
 
-    __constant__ int d_padding_before_weights;
-    __constant__ int d_padding_before_indices;
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
     int global_hist_exclusivesum_offset = local_hist_offset + NUM_EXPERTS;
@@ -197,8 +198,8 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int topk_weights_offset =
         local_offset_offset + topk * ROWS_PER_CTA + d_padding_before_weights;
     int topk_indices_offset =
-        topk_weights_offset + d_padding_before_indices 2 * topk * ROWS_PER_CTA *
-                                  (sizeof(InValDtype) / sizeof(int32_t));
+        topk_weights_offset + d_padding_before_indices +
+        2 * topk * ROWS_PER_CTA * sizeof(InValDtype) / sizeof(int32_t);
     int shared_mem_size = topk_indices_offset + 2 * topk * ROWS_PER_CTA;
 
 #pragma unroll
@@ -253,14 +254,14 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    fused_routing::collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
+    collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
     /* phase 2*/
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // TODO(ijpq): we can leverage warpscan to improve this process, but need
     // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
-    fused_routing::prefix_hist_CTA<NUM_EXPERTS>(
-        cluster, sm_hist + local_hist_offset, sm_hist + expert_across_offset);
+    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
+                                 sm_hist + expert_across_offset);
     cluster.sync();
     int h = 0;
     int lane_id = threadIdx.x % 32;
@@ -362,16 +363,16 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int topk_indices_sm_size = topk * ROWS_PER_CTA;
     // prefetch
     if (row + local_tid < row_end) {
-        fused_routing::cp_async_ca_pred(
+        cp_async_ca_pred(
             (sm_hist + topk_weights_offset +
              current_stage * topk_weights_sm_size + (local_tid * topk)),
             topk_weights + (row + local_tid) * topk);
-        fused_routing::cp_async_cg_pred(
-            sm_hist + topk_indices_offset +
-                current_stage * topk_indices_sm_size + local_tid * topk,
-            topk_indices + (row + local_tid) * topk);
+        cp_async_cg_pred(sm_hist + topk_indices_offset +
+                             current_stage * topk_indices_sm_size +
+                             local_tid * topk,
+                         topk_indices + (row + local_tid) * topk);
     }
-    fused_routing::cp_async_fence();
+    cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
@@ -379,18 +380,18 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         int next_stage = current_stage ^ 1;
         int next_i = i + blockDim.x;
         if (next_i < row_end) {
-            fused_routing::cp_async_ca_pred(
-                sm_hist + topk_weights_offset +
-                    next_stage * topk_weights_sm_size + (local_tid * topk),
-                topk_weights + (next_i * topk));
-            fused_routing::cp_async_cg_pred(
-                sm_hist + topk_indices_offset +
-                    next_stage * topk_indices_sm_size + local_tid * topk,
-                topk_indices + next_i * topk);
-            fused_routing::cp_async_fence();
+            cp_async_ca_pred(sm_hist + topk_weights_offset +
+                                 next_stage * topk_weights_sm_size +
+                                 (local_tid * topk),
+                             topk_weights + (next_i * topk));
+            cp_async_cg_pred(sm_hist + topk_indices_offset +
+                                 next_stage * topk_indices_sm_size +
+                                 local_tid * topk,
+                             topk_indices + next_i * topk);
+            cp_async_fence();
         }
 
-        fused_routing::cp_async_wait<1>();
+        cp_async_wait<1>();
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
@@ -400,10 +401,10 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     // InValDtype val = *reinterpret_cast<InValDtype*>(
                     //     topk_weights + i * topk_val_stride + k);
-                    auto val = *reinterpret_cast<InValDtype*>(
+                    auto val = reinterpret_cast<InValDtype*>(
                         sm_hist + topk_weights_offset +
-                        current_stage * topk_weights_sm_size + local_i * topk +
-                        k);
+                        current_stage *
+                            topk_weights_sm_size)[local_i * topk + k];
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
@@ -434,6 +435,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr) {
+        using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
     namespace cg = cooperative_groups;
@@ -844,6 +846,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
             TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
             size_t static_smem_size = attr.sharedSizeBytes;
+
+            size_t padding_before_weights, padding_before_indices,
+                requried_sm_size;
             auto compute_sm = [&]() {
                 size_t fixed_sm_size = global_hist_size + local_hist_size +
                                        global_hist_prefix_size +
@@ -854,7 +859,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                     MAKE_ALIGNMENT_DIFF(  // 1B unit
                         fixed_sm_size * sizeof(int32_t),
                         sizeof(InValType) * const_topk_padded);
-                size_t padding_before_weights = FUSED_ROUTING_CEIL_DIV(
+                padding_before_weights = FUSED_ROUTING_CEIL_DIV(
                     padding_before_weights_bytes, sizeof(int32_t));
                 size_t padding_before_indices_bytes = MAKE_ALIGNMENT_DIFF(
                     (fixed_sm_size + padding_before_weights +
@@ -862,15 +867,14 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                         sizeof(int32_t),
                     sizeof(int32_t) * const_topk_padded);
 
-                size_t padding_before_indices = FUSED_ROUTING_CEIL_DIV(
+                padding_before_indices = FUSED_ROUTING_CEIL_DIV(
                     padding_before_indices_bytes, sizeof(int32_t));
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_before_weights +
                      topk_weights_size + padding_before_indices +
                      topk_indices_size) *
                     sizeof(int32_t);
-                size_t requried_sm_size =
-                    static_smem_size + required_dynamicSmemBytes;
+                requried_sm_size = static_smem_size + required_dynamicSmemBytes;
                 return requried_sm_size;
             };
             config.dynamicSmemBytes = compute_sm() - static_smem_size;
@@ -966,10 +970,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaMemcpyToSymbol(d_padding_before_weights,
-                               &padding_before_weights, sizeof(int32_t));
-            cudaMemcpyToSymbol(d_padding_before_indices,
-                               &padding_before_indices, sizeof(int32_t));
+            cudaMemcpyToSymbol(
+                vllm::moe::fused_routing::d_padding_before_weights,
+                &padding_before_weights, sizeof(int32_t));
+            cudaMemcpyToSymbol(
+                vllm::moe::fused_routing::d_padding_before_indices,
+                &padding_before_indices, sizeof(int32_t));
 
             cudaLaunchKernelEx(&config, kernel_wrapper, topk_weights_ptr,
                                topk_indices_ptr, max_n_tiles, num_tokens,
