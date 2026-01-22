@@ -643,22 +643,22 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     cluster.sync();
 
-    // int current_stage = 0;
-    // // prefetch
-    // int weights_row_size_int32 =
-    //     topk * sizeof(InValDtype) / sizeof(int32_t);  // = 2
+    int current_stage = 0;
+    // prefetch
+    int weights_row_size_int32 =
+        topk * sizeof(InValDtype) / sizeof(int32_t);  // = 2
 
-    // if (row + local_tid < row_end) {
-    //     cp_async_ca_pred(sm_hist + topk_weights_offset +
-    //                          current_stage * topk_weights_sm_size / num_stages +
-    //                          local_tid * weights_row_size_int32,
-    //                      topk_weights + (row + local_tid) * topk);
-    //     cp_async_cg_pred(sm_hist + topk_indices_offset +
-    //                          current_stage * topk_indices_sm_size / num_stages +
-    //                          local_tid * topk,
-    //                      topk_indices + (row + local_tid) * topk);
-    // }
-    // cp_async_fence();
+    if (row + local_tid < row_end) {
+        cp_async_ca_pred(sm_hist + topk_weights_offset +
+                             current_stage * topk_weights_sm_size / num_stages +
+                             local_tid * weights_row_size_int32,
+                         topk_weights + (row + local_tid) * topk);
+        cp_async_cg_pred(sm_hist + topk_indices_offset +
+                             current_stage * topk_indices_sm_size / num_stages +
+                             local_tid * topk,
+                         topk_indices + (row + local_tid) * topk);
+    }
+    cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
