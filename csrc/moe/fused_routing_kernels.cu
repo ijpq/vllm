@@ -682,18 +682,27 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         topk * sizeof(InValDtype) / sizeof(int32_t);  // = 2
 
     if (row + local_tid < row_end) {
-        debug_cp_async_int32(sm_hist, topk_weights_offset + local_tid * topk, 8,
-                             shared_mem_size, "weights", local_tid);
-        debug_cp_async_int32(sm_hist, topk_indices_offset, 16, shared_mem_size,
-                             "indices");
-        cp_async_ca_pred(sm_hist + topk_weights_offset + local_tid * topk,
-                         topk_weights + (row + local_tid) * topk);
+        // debug_cp_async_int32(sm_hist, topk_weights_offset + local_tid * topk,
+        // 8,
+        //                      shared_mem_size, "weights", local_tid);
+        // debug_cp_async_int32(sm_hist, topk_indices_offset, 16,
+        // shared_mem_size,
+        //                      "indices");
+        printf("in kernel: %d, aligned: %d\n", topk_weights_offset,
+               4 * reinterpret_cast<uintptr_t>(sm_hist + topk_weights_offset) %
+                       8 ==
+                   0);
+        cp_async_ca_pred(
+            reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset) +
+                local_tid * topk,
+            topk_weights + (row + local_tid) * topk);
         cp_async_cg_pred(sm_hist + topk_indices_offset +
                              current_stage * topk_indices_sm_size / num_stages +
                              local_tid * topk,
                          topk_indices + (row + local_tid) * topk);
     }
     cp_async_fence();
+    cp_async_wait<0>();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
@@ -784,13 +793,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t static_smem_size = attr.sharedSizeBytes;
 
             size_t padding_before_weights, padding_before_indices,
-                requried_sm_size;
+                requried_sm_size, fixed_sm_size;
             auto compute_sm = [&]() {
-                size_t fixed_sm_size = global_hist_size + local_hist_size +
-                                       global_hist_prefix_size +
-                                       token_offs_pad_size + block_pid_size +
-                                       prefix_experts_size +
-                                       local_offset_size;  // 4B unit
+                fixed_sm_size = global_hist_size + local_hist_size +
+                                global_hist_prefix_size + token_offs_pad_size +
+                                block_pid_size + prefix_experts_size +
+                                local_offset_size;  // 4B unit
                 size_t alignment_weights =
                     sizeof(InValType) * const_topk_padded;
                 // make fixed sm size align to 8
@@ -863,18 +871,26 @@ void routing_kernel_helper(torch::Tensor& gating_output,
 #endif
             auto grid_dim = dim3(hypo_cluster_size, 1, 1);
             // recompute config
-            if (cluster_size > hypo_cluster_size) {
-                rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-                local_offset_size = const_topk_padded * rows_per_cta;
+            // if (cluster_size > hypo_cluster_size) {
+            //     rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
+            //     local_offset_size = const_topk_padded * rows_per_cta;
+            //     topk_weights_size = 2 * rows_per_cta * const_topk_padded;
+            //     topk_weights_size_int =
+            //         topk_weights_size * sizeof(InValType) / sizeof(int32_t);
+            //     topk_indices_size = 2 * rows_per_cta * const_topk_padded;
+            //     topk_indices_size_int = topk_indices_size;
 
-                config.dynamicSmemBytes = compute_sm() - static_smem_size;
-                cuda_error = cudaFuncSetAttribute(
-                    kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    config.dynamicSmemBytes);
-                TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-                grid_dim = dim3(cluster_size, 1, 1);
-            }
+            //     config.dynamicSmemBytes = compute_sm() - static_smem_size;
+            //     cuda_error = cudaFuncSetAttribute(
+            //         kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            //         config.dynamicSmemBytes);
+            //     TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+            //     grid_dim = dim3(cluster_size, 1, 1);
+            // }
 
+            std::cout << "fixed sm size: " << fixed_sm_size << ","
+                      << "padding weights: " << padding_before_weights
+                      << std::endl;
             config.blockDim = dim3(THREAD_PER_CTA, 1, 1);
             config.gridDim = grid_dim;
 
