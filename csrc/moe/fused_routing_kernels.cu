@@ -22,12 +22,10 @@ namespace moe {
 namespace fused_routing {
 
 #if KERNEL_DEBUG
-__device__ void debug_cp_async_int32(
-    const int32_t* sm_base,
-    int offset_in_int32,   
-    int copy_size_bytes,   
-    int total_smem_int32,  
-    const char* label, int tid = 0) {
+__device__ void debug_cp_async_int32(const int32_t* sm_base,
+                                     int offset_in_int32, int copy_size_bytes,
+                                     int total_smem_int32, const char* label,
+                                     int tid = 0) {
     int byte_offset = offset_in_int32 * sizeof(int32_t);
     int total_bytes = total_smem_int32 * sizeof(int32_t);
 
@@ -50,9 +48,9 @@ __device__ void debug_cp_async_int32(
 }
 #endif
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) ((x + ((y) - 1)) / (y))
+#define FUSED_ROUTING_CEIL_DIV(x, y) ((x + ((y)-1)) / (y))
 
-#define MAKE_ALIGNMENT_DIFF(x, y) (((x + ((y) - 1)) / (y) * (y)) - (x))
+#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + ((y)-1)) / (y) * (y)) - (x))
 
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
@@ -69,7 +67,8 @@ __device__ int swizzle_addr(int row, int col) {
 __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
                                                  const void* glob_ptr,
                                                  bool pred = true) {
-    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    volatile uint32_t smem =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
         "{\n"
         "   .reg .pred p;\n"
@@ -161,7 +160,7 @@ __global__ void fused_routing_kernel(
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
- int padding_indices) {
+    int padding_indices) {
     TORCH_CHECK(false, "unimplemented kernel");
 }
 
@@ -174,7 +173,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
-     int padding_indices) {
+    int padding_indices) {
     using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
@@ -232,7 +231,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int topk_indices_offset =
-        local_offset_offset  + padding_indices;
+        local_offset_offset + ROWS_PER_CTA * topk_padded + padding_indices;
     int shared_mem_size = topk_indices_offset + topk_indices_sm_size;
 
 #pragma unroll
@@ -396,39 +395,41 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //     topk * sizeof(InValDtype) / sizeof(int32_t);  // = 2
 
     // if (row + local_tid < row_end) {
-        // cp_async_ca_pred(sm_hist + topk_weights_offset +
-        //                      current_stage * topk_weights_sm_size / num_stages +
-        //                      local_tid * weights_row_size_int32,
-        //                  topk_weights + (row + local_tid) * topk);
-        cp_async_cg_pred(sm_hist + topk_indices_offset +
-                             current_stage * topk_indices_sm_size / num_stages +
-                             local_tid * topk,
-                         topk_indices + (row + local_tid) * topk, row + local_tid < row_end);
+    // cp_async_ca_pred(sm_hist + topk_weights_offset +
+    //                      current_stage * topk_weights_sm_size / num_stages +
+    //                      local_tid * weights_row_size_int32,
+    //                  topk_weights + (row + local_tid) * topk);
+    // cp_async_cg_pred(sm_hist + topk_indices_offset +
+    //                      current_stage * topk_indices_sm_size / num_stages +
+    //                      local_tid * topk,
+    //                  topk_indices + (row + local_tid) * topk, row + local_tid
+    //                  < row_end);
     // }
-    cp_async_fence();
+    // cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
         int next_stage = current_stage ^ 1;
         int next_i = i + blockDim.x;
-        if (next_i < row_end) {
-            cp_async_cg_pred(
-                sm_hist + topk_indices_offset +
-                    next_stage * topk_indices_sm_size / num_stages +
-                    local_tid * topk,
-                topk_indices + next_i * topk);
-            cp_async_fence();
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
-        }
+        // if (next_i < row_end) {
+        //     cp_async_cg_pred(
+        //         sm_hist + topk_indices_offset +
+        //             next_stage * topk_indices_sm_size / num_stages +
+        //             local_tid * topk,
+        //         topk_indices + next_i * topk);
+        //     cp_async_fence();
+        //     cp_async_wait<1>();
+        // } else {
+        //     cp_async_wait<0>();
+        // }
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
-                int expert_id = *reinterpret_cast<int32_t*>(
-                    sm_hist + topk_indices_offset +
-                    current_stage * topk_indices_sm_size / num_stages +
-                    local_tid * topk_idx_stride + k);
+                int expert_id = topk_indices[i * topk_idx_stride + k];
+                // int expert_id = *reinterpret_cast<int32_t*>(
+                //     sm_hist + topk_indices_offset +
+                //     current_stage * topk_indices_sm_size / num_stages +
+                //     local_tid * topk_idx_stride + k);
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = *reinterpret_cast<InValDtype*>(
                         topk_weights + i * topk_val_stride + k);
@@ -466,7 +467,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
-     int padding_indices) {
+    int padding_indices) {
     using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
@@ -516,7 +517,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     int topk_indices_offset =
-        local_offset_offset + padding_indices;
+        local_offset_offset + ROWS_PER_CTA * topk_padded + padding_indices;
     int shared_mem_size = topk_indices_offset + topk_indices_sm_size;
 
 #pragma unroll
@@ -694,42 +695,43 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //     topk_weights + (row + local_tid) * topk, row + local_tid < row_end);
     // }
 #endif
-    cp_async_cg_pred(sm_hist + topk_indices_offset +
-                         current_stage * topk_indices_sm_size / num_stages +
-                         local_tid * topk,
-                     topk_indices + (row + local_tid) * topk,
-                     row + local_tid < row_end);
-    cp_async_fence();
+    // cp_async_cg_pred(sm_hist + topk_indices_offset +
+
+    //                      local_tid * topk,
+    //                  topk_indices + (row + local_tid) * topk,
+    //                  row + local_tid < row_end);
+    // cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
         int next_stage = current_stage ^ 1;
         int next_i = i + blockDim.x;
-        if (next_i < row_end) {
-#if KERNEL_DEBUG
-            // cp_async_ca_pred(
-            // sm_hist + topk_weights_offset +
-            //     next_stage * topk_weights_sm_size / num_stages +
-            //     local_tid * weights_row_size_int32,
-            // topk_weights + next_i * topk);
-#endif
-            cp_async_cg_pred(
-                sm_hist + topk_indices_offset +
-                    next_stage * topk_indices_sm_size / num_stages +
-                    local_tid * topk,
-                topk_indices + next_i * topk, next_i < row_end);
-            cp_async_fence();
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
-        }
+        //         if (next_i < row_end) {
+        // #if KERNEL_DEBUG
+        //             // cp_async_ca_pred(
+        //             // sm_hist + topk_weights_offset +
+        //             //     next_stage * topk_weights_sm_size / num_stages +
+        //             //     local_tid * weights_row_size_int32,
+        //             // topk_weights + next_i * topk);
+        // #endif
+        //             cp_async_cg_pred(
+        //                 sm_hist + topk_indices_offset +
+        //                     next_stage * topk_indices_sm_size / num_stages +
+        //                     local_tid * topk,
+        //                 topk_indices + next_i * topk, next_i < row_end);
+        //             cp_async_fence();
+        //             cp_async_wait<1>();
+        //         } else {
+        //             cp_async_wait<0>();
+        //         }
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
-                int expert_id = *reinterpret_cast<int32_t*>(
-                    sm_hist + topk_indices_offset +
-                    current_stage * topk_indices_sm_size / num_stages +
-                    local_tid * topk_idx_stride + k);
+                // int expert_id = *reinterpret_cast<int32_t*>(
+                //     sm_hist + topk_indices_offset +
+                //     current_stage * topk_indices_sm_size / num_stages +
+                //     local_tid * topk_idx_stride + k);
+                int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = topk_weights[i * topk_val_stride + k];
 #if KERNEL_DEBUG
@@ -818,25 +820,24 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t static_smem_size = attr.sharedSizeBytes;
 
             size_t padding_indices, requried_sm_size, fixed_sm_size;
+            int alignment_indices = 16;
             auto compute_sm = [&]() {
                 fixed_sm_size = global_hist_size + local_hist_size +
                                 global_hist_prefix_size + token_offs_pad_size +
                                 block_pid_size + prefix_experts_size +
                                 local_offset_size;  // 4B unit
                 // make sm size align to 16
-                size_t alignment_indices = sizeof(int32_t) * const_topk_padded;
                 size_t padding_before_indices_bytes = MAKE_ALIGNMENT_DIFF(
-                    (fixed_sm_size) * sizeof(int32_t), alignment_indices);
+                    fixed_sm_size * sizeof(int32_t), alignment_indices);
 
                 padding_indices = FUSED_ROUTING_CEIL_DIV(
                     padding_before_indices_bytes, sizeof(int32_t));
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_indices + topk_indices_size_int) *
                     sizeof(int32_t);
-                requried_sm_size = static_smem_size + required_dynamicSmemBytes;
-                return requried_sm_size;
+                return required_dynamicSmemBytes;
             };
-            config.dynamicSmemBytes = compute_sm() - static_smem_size;
+            config.dynamicSmemBytes = compute_sm();
 
             // dev id
             int dev_id = 0;
@@ -886,7 +887,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 topk_indices_size = 2 * rows_per_cta * const_topk_padded;
                 topk_indices_size_int = topk_indices_size;
 
-                config.dynamicSmemBytes = compute_sm() - static_smem_size;
+                config.dynamicSmemBytes = compute_sm();
                 cuda_error = cudaFuncSetAttribute(
                     kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
                     config.dynamicSmemBytes);
@@ -930,8 +931,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                                topk_indices_ptr, max_n_tiles, num_tokens,
                                gate_scale_ptr, topk_index_ptr, gate_index_ptr,
                                token_offs_pad_ptr, block_pid_map_ptr,
-                               expt_offs_ptr, hist_ptr, 
-                               padding_indices);
+                               expt_offs_ptr, hist_ptr, padding_indices);
             break;
         }
         case 128: {
@@ -961,32 +961,25 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
             size_t static_smem_size = attr.sharedSizeBytes;
 
-            size_t padding_indices,
-                requried_sm_size, fixed_sm_size;
+            size_t padding_indices, requried_sm_size, fixed_sm_size;
+            int alignment_indices = 16;
             auto compute_sm = [&]() {
                 fixed_sm_size = global_hist_size + local_hist_size +
-                                       global_hist_prefix_size +
-                                       token_offs_pad_size + block_pid_size +
-                                       prefix_experts_size +
-                                       local_offset_size;  // 4B unit
+                                global_hist_prefix_size + token_offs_pad_size +
+                                block_pid_size + prefix_experts_size +
+                                local_offset_size;  // 4B unit
                 // make sm size align to 16
-                size_t alignment_indices = sizeof(int32_t) * const_topk_padded;
                 size_t padding_before_indices_bytes = MAKE_ALIGNMENT_DIFF(
-                    (fixed_sm_size) *
-                        sizeof(int32_t),
-                    alignment_indices);
+                    fixed_sm_size * sizeof(int32_t), alignment_indices);
 
                 padding_indices = FUSED_ROUTING_CEIL_DIV(
                     padding_before_indices_bytes, sizeof(int32_t));
                 size_t required_dynamicSmemBytes =
-                    (fixed_sm_size + 
-                     padding_indices +
-                     topk_indices_size_int) *
+                    (fixed_sm_size + padding_indices + topk_indices_size_int) *
                     sizeof(int32_t);
-                requried_sm_size = static_smem_size + required_dynamicSmemBytes;
-                return requried_sm_size;
+                return required_dynamicSmemBytes;
             };
-            config.dynamicSmemBytes = compute_sm() - static_smem_size;
+            config.dynamicSmemBytes = compute_sm();
 
             // dev id
             int dev_id = 0;
@@ -1036,7 +1029,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 topk_indices_size = 2 * rows_per_cta * const_topk_padded;
                 topk_indices_size_int = topk_indices_size;
 
-                config.dynamicSmemBytes = compute_sm() - static_smem_size;
+                config.dynamicSmemBytes = compute_sm();
                 cuda_error = cudaFuncSetAttribute(
                     kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
                     config.dynamicSmemBytes);
@@ -1075,8 +1068,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                                topk_indices_ptr, max_n_tiles, num_tokens,
                                gate_scale_ptr, topk_index_ptr, gate_index_ptr,
                                token_offs_pad_ptr, block_pid_map_ptr,
-                               expt_offs_ptr, hist_ptr,
-                               padding_indices);
+                               expt_offs_ptr, hist_ptr, padding_indices);
 
             break;
         }
