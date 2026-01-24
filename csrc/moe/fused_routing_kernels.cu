@@ -48,9 +48,9 @@ __device__ void debug_cp_async_int32(const int32_t* sm_base,
 }
 #endif
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) ((x + ((y)-1)) / (y))
+#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + ((y) - 1)) / (y))
 
-#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + ((y)-1)) / (y) * (y)) - (x))
+#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + ((y) - 1)) / (y) * (y)) - (x))
 
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
@@ -98,6 +98,9 @@ __device__ inline void cp_async_fence() {
 template <int n>
 __device__ inline void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+__device__ inline void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all ;\n" );
 }
 
 template <int NUM_EXPERTS>
@@ -695,12 +698,14 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //     topk_weights + (row + local_tid) * topk, row + local_tid < row_end);
     // }
 #endif
-    // cp_async_cg_pred(sm_hist + topk_indices_offset +
-
-    //                      local_tid * topk,
-    //                  topk_indices + (row + local_tid) * topk,
-    //                  row + local_tid < row_end);
-    // cp_async_fence();
+    // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset) & 0xF) !=
+    //         0 ||
+    //     (reinterpret_cast<uintptr_t>(topk_indices) & 0xF) != 0)
+    //     printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset, topk_indices);
+    cp_async_cg_pred(sm_hist + topk_indices_offset, topk_indices,
+                     row + local_tid < row_end);
+    cp_async_fence();
+    cp_async_wait_all();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
