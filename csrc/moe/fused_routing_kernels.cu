@@ -5,6 +5,9 @@
 #include "../cuda_compat.h"
 #include "../cub_helpers.h"
 #include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+#include <cuda/barrier>
+
 
 #define KERNEL_DEBUG 0
 #ifndef USE_ROCM
@@ -48,9 +51,9 @@ __device__ void debug_cp_async_int32(const int32_t* sm_base,
 }
 #endif
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + ((y) - 1)) / (y))
+#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 
-#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + ((y) - 1)) / (y) * (y)) - (x))
+#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y) - 1) / (y) * (y)) - (x))
 
 __device__ int swizzle_addr(int row, int col) {
     constexpr int COLS = 4;  // topk
@@ -702,10 +705,13 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //         0 ||
     //     (reinterpret_cast<uintptr_t>(topk_indices) & 0xF) != 0)
     //     printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset, topk_indices);
-    cp_async_cg_pred(sm_hist + topk_indices_offset, topk_indices,
-                     row + local_tid < row_end);
-    cp_async_fence();
-    cp_async_wait_all();
+    // cp_async_cg_pred(sm_hist + topk_indices_offset, topk_indices,
+    //                  row + local_tid < row_end);
+    // cp_async_fence();
+    // cp_async_wait_all();
+    auto block = cooperative_groups::this_thread_block();
+    cg::memcpy_async(block, sm_hist + topk_indices_offset , topk_indices,  cuda::aligned_size_t<16>(sizeof(int32_t) * ROWS_PER_CTA * topk));
+    cg::wait(block);
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
@@ -732,10 +738,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         //         }
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
-                // int expert_id = *reinterpret_cast<int32_t*>(
-                //     sm_hist + topk_indices_offset +
-                //     current_stage * topk_indices_sm_size / num_stages +
-                //     local_tid * topk_idx_stride + k);
+            //     int expert_id = *reinterpret_cast<int32_t*>(
+            //         sm_hist + topk_indices_offset +
+            //         current_stage * topk_indices_sm_size / num_stages +
+            //         local_tid * topk_idx_stride + k);
                 int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = topk_weights[i * topk_val_stride + k];
@@ -840,6 +846,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_indices + topk_indices_size_int) *
                     sizeof(int32_t);
+                    requried_sm_size = required_dynamicSmemBytes + static_smem_size;
                 return required_dynamicSmemBytes;
             };
             config.dynamicSmemBytes = compute_sm();
@@ -982,6 +989,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_indices + topk_indices_size_int) *
                     sizeof(int32_t);
+                    requried_sm_size = required_dynamicSmemBytes + static_smem_size;
                 return required_dynamicSmemBytes;
             };
             config.dynamicSmemBytes = compute_sm();
