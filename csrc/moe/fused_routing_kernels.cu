@@ -701,21 +701,31 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //     topk_weights + (row + local_tid) * topk, row + local_tid < row_end);
     // }
 #endif
-    // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset) & 0xF) !=
+    // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset + local_tid * topk) & 0xF) !=
     //         0 ||
-    //     (reinterpret_cast<uintptr_t>(topk_indices) & 0xF) != 0)
+    //     (reinterpret_cast<uintptr_t>(topk_indices + (row + local_tid) * topk) & 0xF) != 0)
     //     printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset,
     //     topk_indices);
     int safe_row = min(row_end, row + local_tid);
-    if (row + local_tid < row_end) {
-        cp_async_cg_pred(sm_hist + topk_indices_offset + local_tid * topk,
-                         topk_indices + safe_row * topk);
-    }
-    cp_async_fence();
-    cp_async_wait<0>();
+    __shared__ int32_t sm[4];
+    for (int stage = 0; stage < 2; stage ++) {
+    int32_t* indices_ptr = sm_hist + topk_indices_offset + stage * topk * THREAD_PER_CTA;
+            for (int k = 0; k < topk; k++) {
+                indices_ptr[local_tid+k] = local_tid;  
+            }
+        }
+    // __syncthreads();
+    // if (row + local_tid < row_end) {
+    //     cp_async_cg_pred(&indices_ptr[local_tid * topk],
+    //                      topk_indices + safe_row * topk);
+    //     // cp_async_cg_pred(sm,
+    //     //                  topk_indices + safe_row * topk);
+    // }
+    // cp_async_fence();
+    // cp_async_wait<0>();
     // auto block = cooperative_groups::this_thread_block();
     // cg::memcpy_async(block, sm_hist + topk_indices_offset , topk_indices,
-    // cuda::aligned_size_t<16>(sizeof(int32_t) * ROWS_PER_CTA * topk));
+    // cuda::aligned_size_t<16>(sizeof(int32_t) * THREAD_PER_CTA * topk));
     // cg::wait(block);
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
@@ -898,17 +908,17 @@ void routing_kernel_helper(torch::Tensor& gating_output,
 #endif
             auto grid_dim = dim3(hypo_cluster_size, 1, 1);
             // recompute config
-            if (cluster_size > hypo_cluster_size) {
-                rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-                local_offset_size = const_topk_padded * rows_per_cta;
+            // if (cluster_size > hypo_cluster_size) {
+            //     rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
+            //     local_offset_size = const_topk_padded * rows_per_cta;
 
-                config.dynamicSmemBytes = compute_sm();
-                cuda_error = cudaFuncSetAttribute(
-                    kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    config.dynamicSmemBytes);
-                TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-                grid_dim = dim3(cluster_size, 1, 1);
-            }
+            //     config.dynamicSmemBytes = compute_sm();
+            //     cuda_error = cudaFuncSetAttribute(
+            //         kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            //         config.dynamicSmemBytes);
+            //     TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+            //     grid_dim = dim3(cluster_size, 1, 1);
+            // }
 
 #if KERNEL_DEBUG
             std::cout << "fixed sm size: " << fixed_sm_size << ","
