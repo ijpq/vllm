@@ -8,7 +8,6 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/barrier>
 
-
 #define KERNEL_DEBUG 0
 #ifndef USE_ROCM
     #include <cuda_bf16.h>
@@ -103,7 +102,7 @@ __device__ inline void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 }
 __device__ inline void cp_async_wait_all() {
-    asm volatile("cp.async.wait_all ;\n" );
+    asm volatile("cp.async.wait_all ;\n");
 }
 
 template <int NUM_EXPERTS>
@@ -491,6 +490,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
     int ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, gridDim.x);
     int HYPO_ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, 8);
+    static constexpr int THREAD_PER_CTA = 512;
     static constexpr int warp_size = 32;
     static constexpr int num_stages = 2;
 
@@ -510,8 +510,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         temp_storage_hist[NUM_EXPERTS / warp_size];
     __shared__
         typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
-    extern __shared__ int32_t sm_hist[];
-    int topk_indices_sm_size = num_stages * topk_padded * ROWS_PER_CTA;
+    extern __shared__ __align__(16) int32_t sm_hist[];
+    int topk_indices_sm_size = num_stages * topk_padded * THREAD_PER_CTA;
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
     int global_hist_exclusivesum_offset = local_hist_offset + NUM_EXPERTS;
@@ -704,14 +704,19 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset) & 0xF) !=
     //         0 ||
     //     (reinterpret_cast<uintptr_t>(topk_indices) & 0xF) != 0)
-    //     printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset, topk_indices);
-    // cp_async_cg_pred(sm_hist + topk_indices_offset, topk_indices,
-    //                  row + local_tid < row_end);
-    // cp_async_fence();
-    // cp_async_wait_all();
-    auto block = cooperative_groups::this_thread_block();
-    cg::memcpy_async(block, sm_hist + topk_indices_offset , topk_indices,  cuda::aligned_size_t<16>(sizeof(int32_t) * ROWS_PER_CTA * topk));
-    cg::wait(block);
+    //     printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset,
+    //     topk_indices);
+    int safe_row = min(row_end, row + local_tid);
+    if (row + local_tid < row_end) {
+        cp_async_cg_pred(sm_hist + topk_indices_offset + local_tid * topk,
+                         topk_indices + safe_row * topk);
+    }
+    cp_async_fence();
+    cp_async_wait<0>();
+    // auto block = cooperative_groups::this_thread_block();
+    // cg::memcpy_async(block, sm_hist + topk_indices_offset , topk_indices,
+    // cuda::aligned_size_t<16>(sizeof(int32_t) * ROWS_PER_CTA * topk));
+    // cg::wait(block);
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
@@ -738,10 +743,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         //         }
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
-            //     int expert_id = *reinterpret_cast<int32_t*>(
-            //         sm_hist + topk_indices_offset +
-            //         current_stage * topk_indices_sm_size / num_stages +
-            //         local_tid * topk_idx_stride + k);
+                //     int expert_id = *reinterpret_cast<int32_t*>(
+                //         sm_hist + topk_indices_offset +
+                //         current_stage * topk_indices_sm_size / num_stages +
+                //         local_tid * topk_idx_stride + k);
                 int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = topk_weights[i * topk_val_stride + k];
@@ -806,7 +811,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
         case 32: {
             auto warp_size = 32;
             int cluster_size = 0;
-            int THREAD_PER_CTA = 512;
+            static constexpr int THREAD_PER_CTA = 512;
 
             int hypo_cluster_size = 8;
             size_t rows_per_cta =
@@ -818,7 +823,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size = const_topk_padded * rows_per_cta;
-            size_t topk_indices_size = 2 * rows_per_cta * const_topk_padded;
+            size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_indices_size_int = topk_indices_size;
             auto kernel_wrapper = &(
                 vllm::moe::fused_routing_kernel<32, const_topk, NUM_BLOCK_SIZES,
@@ -846,7 +851,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_indices + topk_indices_size_int) *
                     sizeof(int32_t);
-                    requried_sm_size = required_dynamicSmemBytes + static_smem_size;
+                requried_sm_size = required_dynamicSmemBytes + static_smem_size;
                 return required_dynamicSmemBytes;
             };
             config.dynamicSmemBytes = compute_sm();
@@ -896,8 +901,6 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             if (cluster_size > hypo_cluster_size) {
                 rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
                 local_offset_size = const_topk_padded * rows_per_cta;
-                topk_indices_size = 2 * rows_per_cta * const_topk_padded;
-                topk_indices_size_int = topk_indices_size;
 
                 config.dynamicSmemBytes = compute_sm();
                 cuda_error = cudaFuncSetAttribute(
@@ -961,7 +964,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size = const_topk_padded * rows_per_cta;
-            size_t topk_indices_size = 2 * rows_per_cta * const_topk_padded;
+            size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_indices_size_int = topk_indices_size;
             auto kernel_wrapper =
                 &(vllm::moe::fused_routing_kernel<
@@ -989,7 +992,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_indices + topk_indices_size_int) *
                     sizeof(int32_t);
-                    requried_sm_size = required_dynamicSmemBytes + static_smem_size;
+                requried_sm_size = required_dynamicSmemBytes + static_smem_size;
                 return required_dynamicSmemBytes;
             };
             config.dynamicSmemBytes = compute_sm();
@@ -1039,7 +1042,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             if (cluster_size > hypo_cluster_size) {
                 rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
                 local_offset_size = const_topk_padded * rows_per_cta;
-                topk_indices_size = 2 * rows_per_cta * const_topk_padded;
+                topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
                 topk_indices_size_int = topk_indices_size;
 
                 config.dynamicSmemBytes = compute_sm();
