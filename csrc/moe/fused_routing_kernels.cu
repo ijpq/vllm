@@ -522,8 +522,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int expert_across_offset =
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
+    size_t local_offset_size =
+        ((ROWS_PER_CTA * topk_padded + 31) / 32 + 1) * 32;
     int topk_indices_offset =
-        local_offset_offset + ROWS_PER_CTA * topk_padded + padding_indices;
+        local_offset_offset + local_offset_size + padding_indices;
     int shared_mem_size = topk_indices_offset + topk_indices_sm_size;
 
 #pragma unroll
@@ -701,28 +703,32 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //     topk_weights + (row + local_tid) * topk, row + local_tid < row_end);
     // }
 #endif
-    // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset + local_tid * topk) & 0xF) !=
+    // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset +
+    // local_tid * topk) & 0xF) !=
     //         0 ||
-    //     (reinterpret_cast<uintptr_t>(topk_indices + (row + local_tid) * topk) & 0xF) != 0)
-    //     printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset,
+    //     (reinterpret_cast<uintptr_t>(topk_indices + (row + local_tid) * topk)
+    //     & 0xF) != 0) printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset,
     //     topk_indices);
     int safe_row = min(row_end, row + local_tid);
-    __shared__ int32_t sm[4];
-    for (int stage = 0; stage < 2; stage ++) {
-    int32_t* indices_ptr = sm_hist + topk_indices_offset + stage * topk * THREAD_PER_CTA;
-            for (int k = 0; k < topk; k++) {
-                indices_ptr[local_tid+k] = local_tid;  
-            }
-        }
-    // __syncthreads();
-    // if (row + local_tid < row_end) {
-    //     cp_async_cg_pred(&indices_ptr[local_tid * topk],
-    //                      topk_indices + safe_row * topk);
-    //     // cp_async_cg_pred(sm,
-    //     //                  topk_indices + safe_row * topk);
+    // __shared__ int32_t sm[4];
+    // for (int stage = 0; stage < 2; stage++) {
+    //     int32_t* indices_ptr =
+    //         sm_hist + topk_indices_offset + stage * topk * THREAD_PER_CTA;
+    //     for (int k = 0; k < topk; k++) {
+    //         indices_ptr[local_tid + k] = local_tid;
+    //     }
     // }
-    // cp_async_fence();
-    // cp_async_wait<0>();
+    // __syncthreads();
+    int32_t* indices_ptr =
+        sm_hist + topk_indices_offset;
+    if (row + local_tid < row_end) {
+        cp_async_cg_pred(&indices_ptr[local_tid * topk],
+                         topk_indices + safe_row * topk);
+        // cp_async_cg_pred(sm,
+        //                  topk_indices + safe_row * topk);
+    }
+    cp_async_fence();
+    cp_async_wait<0>();
     // auto block = cooperative_groups::this_thread_block();
     // cg::memcpy_async(block, sm_hist + topk_indices_offset , topk_indices,
     // cuda::aligned_size_t<16>(sizeof(int32_t) * THREAD_PER_CTA * topk));
@@ -832,7 +838,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
-            size_t local_offset_size = const_topk_padded * rows_per_cta;
+            size_t local_offset_size =
+                ((rows_per_cta * const_topk_padded + 31) / 32 + 1) * 32;
             size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_indices_size_int = topk_indices_size;
             auto kernel_wrapper = &(
@@ -908,17 +915,18 @@ void routing_kernel_helper(torch::Tensor& gating_output,
 #endif
             auto grid_dim = dim3(hypo_cluster_size, 1, 1);
             // recompute config
-            // if (cluster_size > hypo_cluster_size) {
-            //     rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-            //     local_offset_size = const_topk_padded * rows_per_cta;
+            if (cluster_size > hypo_cluster_size) {
+                rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
+                local_offset_size =
+                    ((rows_per_cta * const_topk_padded + 31) / 32 + 1) * 32;
 
-            //     config.dynamicSmemBytes = compute_sm();
-            //     cuda_error = cudaFuncSetAttribute(
-            //         kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            //         config.dynamicSmemBytes);
-            //     TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-            //     grid_dim = dim3(cluster_size, 1, 1);
-            // }
+                config.dynamicSmemBytes = compute_sm();
+                cuda_error = cudaFuncSetAttribute(
+                    kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    config.dynamicSmemBytes);
+                TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
+                grid_dim = dim3(cluster_size, 1, 1);
+            }
 
 #if KERNEL_DEBUG
             std::cout << "fixed sm size: " << fixed_sm_size << ","
