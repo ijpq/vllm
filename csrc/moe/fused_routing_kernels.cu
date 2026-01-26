@@ -66,6 +66,17 @@ __device__ int swizzle_addr(int row, int col) {
 
     return block * 32 + swizzled_offset;
 }
+
+__device__ int layout_addr(int row, int col) {
+    constexpr int COLS = 4;  // topk
+    constexpr int warp_size = 32;
+    int elem_idx = row % warp_size ;
+    int group = col;
+    int group_offset = col * warp_size;
+    int warp_offset = row / warp_size * warp_size * COLS;
+    int addr = warp_offset + group_offset + elem_idx;
+    return addr;
+}
 __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
                                                  const void* glob_ptr,
                                                  bool pred = true) {
@@ -522,8 +533,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int expert_across_offset =
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
-    size_t local_offset_size =
-        ((ROWS_PER_CTA * topk_padded + 31) / 32 + 1) * 32;
+    size_t        local_offset_size = FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, THREAD_PER_CTA ) * THREAD_PER_CTA * topk;
     int topk_indices_offset =
         local_offset_offset + local_offset_size + padding_indices;
     int shared_mem_size = topk_indices_offset + topk_indices_sm_size;
@@ -564,16 +574,16 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
         int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            local_offset_sm[swizzle_addr(local_i, 0)] =
+            local_offset_sm[layout_addr(local_i, 0)] =
                 atomicAdd(local_hist + expt0, 1);
         if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-            local_offset_sm[swizzle_addr(local_i, 1)] =
+            local_offset_sm[layout_addr(local_i, 1)] =
                 atomicAdd(local_hist + expt1, 1);
         if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-            local_offset_sm[swizzle_addr(local_i, 2)] =
+            local_offset_sm[layout_addr(local_i, 2)] =
                 atomicAdd(local_hist + expt2, 1);
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-            local_offset_sm[swizzle_addr(local_i, 3)] =
+            local_offset_sm[layout_addr(local_i, 3)] =
                 atomicAdd(local_hist + expt3, 1);
     }
     cluster.sync();
@@ -679,91 +689,42 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
 
     int current_stage = 0;
-#if KERNEL_DEBUG
-    // TODO(ijpq): cuda graph IMA even when weights 8B alignment has met.
-    // prefetch
-    // int weights_row_size_int32 =
-    //     topk * sizeof(InValDtype) / sizeof(int32_t);  // = 2
 
-    // if (row + local_tid < row_end) {
-    // debug_cp_async_int32(sm_hist, topk_weights_offset + local_tid * topk,
-    // 8,
-    //                      shared_mem_size, "weights", local_tid);
-    // debug_cp_async_int32(sm_hist, topk_indices_offset, 16,
-    // shared_mem_size,
-    //                      "indices");
-    // printf("in kernel: %d, aligned: %d\n", topk_weights_offset,
-    //        (reinterpret_cast<uintptr_t>(reinterpret_cast<__nv_bfloat16*>(sm_hist
-    //        + topk_weights_offset) + local_tid * topk )) %
-    //                8 ==
-    //            0);
-    // cp_async_ca_pred(
-    //     reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset) +
-    //         local_tid * topk,
-    //     topk_weights + (row + local_tid) * topk, row + local_tid < row_end);
-    // }
-#endif
-    // if ((reinterpret_cast<uintptr_t>(sm_hist + topk_indices_offset +
-    // local_tid * topk) & 0xF) !=
-    //         0 ||
-    //     (reinterpret_cast<uintptr_t>(topk_indices + (row + local_tid) * topk)
-    //     & 0xF) != 0) printf("sm: %p, g: %p\n", sm_hist + topk_indices_offset,
-    //     topk_indices);
     int safe_row = min(row_end, row + local_tid);
-    // __shared__ int32_t sm[4];
-    // for (int stage = 0; stage < 2; stage++) {
-    //     int32_t* indices_ptr =
-    //         sm_hist + topk_indices_offset + stage * topk * THREAD_PER_CTA;
-    //     for (int k = 0; k < topk; k++) {
-    //         indices_ptr[local_tid + k] = local_tid;
-    //     }
-    // }
-    // __syncthreads();
     int32_t* indices_ptr =
         sm_hist + topk_indices_offset;
-    if (row + local_tid < row_end) {
         cp_async_cg_pred(&indices_ptr[local_tid * topk],
-                         topk_indices + safe_row * topk);
-        // cp_async_cg_pred(sm,
-        //                  topk_indices + safe_row * topk);
-    }
+                         topk_indices + safe_row * topk, row + local_tid < row_end);
     cp_async_fence();
-    cp_async_wait<0>();
-    // auto block = cooperative_groups::this_thread_block();
-    // cg::memcpy_async(block, sm_hist + topk_indices_offset , topk_indices,
-    // cuda::aligned_size_t<16>(sizeof(int32_t) * THREAD_PER_CTA * topk));
-    // cg::wait(block);
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
         int next_stage = current_stage ^ 1;
         int next_i = i + blockDim.x;
-        //         if (next_i < row_end) {
-        // #if KERNEL_DEBUG
-        //             // cp_async_ca_pred(
-        //             // sm_hist + topk_weights_offset +
-        //             //     next_stage * topk_weights_sm_size / num_stages +
-        //             //     local_tid * weights_row_size_int32,
-        //             // topk_weights + next_i * topk);
-        // #endif
-        //             cp_async_cg_pred(
-        //                 sm_hist + topk_indices_offset +
-        //                     next_stage * topk_indices_sm_size / num_stages +
-        //                     local_tid * topk,
-        //                 topk_indices + next_i * topk, next_i < row_end);
-        //             cp_async_fence();
-        //             cp_async_wait<1>();
-        //         } else {
-        //             cp_async_wait<0>();
-        //         }
+            if (next_i < row_end) {
+                    // cp_async_ca_pred(
+                    // sm_hist + topk_weights_offset +
+                    //     next_stage * topk_weights_sm_size / num_stages +
+                    //     local_tid * weights_row_size_int32,
+                    // topk_weights + next_i * topk);
+                    cp_async_cg_pred(
+                        sm_hist + topk_indices_offset +
+                            next_stage * topk_indices_sm_size / num_stages +
+                            local_tid * topk,
+                        topk_indices + next_i * topk, next_i < row_end);
+                    cp_async_fence();
+                    cp_async_wait<1>();
+                } else {
+                    cp_async_wait<0>();
+                }
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
-                //     int expert_id = *reinterpret_cast<int32_t*>(
-                //         sm_hist + topk_indices_offset +
-                //         current_stage * topk_indices_sm_size / num_stages +
-                //         local_tid * topk_idx_stride + k);
-                int expert_id = topk_indices[i * topk_idx_stride + k];
+                    int expert_id = *reinterpret_cast<int32_t*>(
+                        sm_hist + topk_indices_offset +
+                        current_stage * topk_indices_sm_size / num_stages +
+                        local_tid * topk_idx_stride + k);
+                // int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     InValDtype val = topk_weights[i * topk_val_stride + k];
 #if KERNEL_DEBUG
@@ -776,7 +737,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
                     int expert_local =
-                        local_offset_sm[swizzle_addr(local_i, k)];
+                        local_offset_sm[layout_addr(local_i, k)];
 
                     int global_pos = expert_base + expert_prior + expert_local;
 
@@ -838,8 +799,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
-            size_t local_offset_size =
-                ((rows_per_cta * const_topk_padded + 31) / 32 + 1) * 32;
+            // size_t local_offset_size =
+            //     ((rows_per_cta * const_topk_padded + 31) / 32 + 1) * 32;
+            size_t local_offset_size = FUSED_ROUTING_CEIL_DIV(rows_per_cta, THREAD_PER_CTA ) * THREAD_PER_CTA * topk;
             size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_indices_size_int = topk_indices_size;
             auto kernel_wrapper = &(
@@ -917,8 +879,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             // recompute config
             if (cluster_size > hypo_cluster_size) {
                 rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
-                local_offset_size =
-                    ((rows_per_cta * const_topk_padded + 31) / 32 + 1) * 32;
+            local_offset_size = FUSED_ROUTING_CEIL_DIV(rows_per_cta, THREAD_PER_CTA ) * THREAD_PER_CTA * topk;
+                // local_offset_size =
+                //     ((rows_per_cta * const_topk_padded + 31) / 32 + 1) * 32;
 
                 config.dynamicSmemBytes = compute_sm();
                 cuda_error = cudaFuncSetAttribute(
