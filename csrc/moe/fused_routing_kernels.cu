@@ -536,7 +536,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     __shared__
         typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ __align__(16) int32_t sm_hist[];
-    int topk_indices_sm_size = num_stages * topk_padded * THREAD_PER_CTA;
+    int topk_indices_sm_size = topk_padded * ROWS_PER_CTA;
     int topk_weights_sm_size = num_stages * topk_padded * THREAD_PER_CTA *
                                sizeof(InValDtype) / sizeof(int32_t);
     int global_hist_offset = 0;
@@ -570,7 +570,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     }
     cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
-    /*phase 1*/
+    /*===================================phase 1*/
     int32_t* local_hist =
         reinterpret_cast<int32_t*>(sm_hist + local_hist_offset);
     int32_t* local_offset_sm =
@@ -579,7 +579,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int row_end = min((int64_t)(row + ROWS_PER_CTA),
                       NUM_TOKENS);  // Each CTA only processes its own rows
 
-    // prefetch
+    // prefetch topk*THREAD_PER_CTA
     int gmem_it = 0, stage = 0;
     int32_t* indices_ptr = sm_hist + topk_indices_offset;
     int safe_row = min(row_end, row + local_tid);
@@ -588,17 +588,16 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end;
-         i += blockDim.x) {  // mem transaction = warp_size * topk *
+         i += THREAD_PER_CTA) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
         int local_i = i - row;
-        // int next_stage = current_stage ^ 1;
-        stage = gmem_it & 1;
-        int next_i = i + blockDim.x;
+        int next_i = i + THREAD_PER_CTA;
+        stage = gmem_it;
         if (next_i < row_end) {
             gmem_it++;
             cp_async_cg_pred(
-                sm_hist + topk_indices_offset +
-                    (gmem_it & 1) * topk_indices_sm_size / num_stages +
+                indices_ptr + 
+                    gmem_it * THREAD_PER_CTA * topk +
                     local_tid * topk,
                 topk_indices + next_i * topk, next_i < row_end);
             cp_async_fence();
@@ -611,8 +610,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         if (i >= 0 && i < NUM_TOKENS) {
             // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
             expts = *reinterpret_cast<int4*>(
-                sm_hist + topk_indices_offset +
-                stage * topk_indices_sm_size / num_stages + local_tid * topk);
+                indices_ptr + 
+                stage * THREAD_PER_CTA * topk + local_tid * topk);
             expt0 = expts.x;
             expt1 = expts.y;
             expt2 = expts.z;
@@ -630,14 +629,13 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
             local_offset_sm[layout_addr(local_i, 3)] =
                 atomicAdd(local_hist + expt3, 1);
-        // current_stage ^= 1;
     }
     cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
     collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
 
-    /* phase 2*/
+    /*===========================================phase 2*/
     int warp_id = threadIdx.x / 32;
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
@@ -714,7 +712,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     }
     cluster.sync();
 
-    /* phase 3*/
+    /*=============================================phase 3*/
 
     int32_t* prior_contrib =
         reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
@@ -733,15 +731,14 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
 
     gmem_it = 0, stage = 0;
-    // int safe_row = min(row_end, row + local_tid);
-    // int32_t* indices_ptr = sm_hist + topk_indices_offset;
+    int indices_sm_idx = 0;
     InValDtype* weights_ptr =
         reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
 
     cp_async_ca_pred(&weights_ptr[local_tid * topk],
                      topk_weights + safe_row * topk, row + local_tid < row_end);
-    cp_async_cg_pred(&indices_ptr[local_tid * topk],
-                     topk_indices + safe_row * topk, row + local_tid < row_end);
+    // cp_async_cg_pred(&indices_ptr[local_tid * topk],
+    //                  topk_indices + safe_row * topk, row + local_tid < row_end);
     cp_async_fence();
 
 #pragma unroll
@@ -749,6 +746,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
         stage = gmem_it & 1;
+        indices_sm_idx = gmem_it;
         int next_i = i + blockDim.x;
         if (next_i < row_end) {
             gmem_it++;
@@ -756,11 +754,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 &weights_ptr[(gmem_it & 1) * THREAD_PER_CTA * topk +
                              local_tid * topk],
                 topk_weights + next_i * topk, next_i < row_end);
-            cp_async_cg_pred(
-                sm_hist + topk_indices_offset +
-                    (gmem_it & 1) * topk_indices_sm_size / num_stages +
-                    local_tid * topk,
-                topk_indices + next_i * topk, next_i < row_end);
+            // cp_async_cg_pred(
+            //     sm_hist + topk_indices_offset +
+            //         (gmem_it & 1) * topk_indices_sm_size / num_stages +
+            //         local_tid * topk,
+            //     topk_indices + next_i * topk, next_i < row_end);
             cp_async_fence();
             cp_async_wait<1>();
         } else {
@@ -769,12 +767,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
-                    sm_hist + topk_indices_offset +
-                    stage * topk_indices_sm_size / num_stages +
+                    indices_ptr +
+                    indices_sm_idx * THREAD_PER_CTA * topk +
                     local_tid * topk_idx_stride + k);
-                // int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                    // InValDtype val = topk_weights[i * topk_val_stride + k];
                     auto val = *reinterpret_cast<InValDtype*>(
                         &weights_ptr[stage * THREAD_PER_CTA * topk +
                                      local_tid * topk + k]);
@@ -835,7 +831,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             static constexpr int THREAD_PER_CTA = 512;
 
             int hypo_cluster_size = 8;
-            size_t rows_per_cta =
+            size_t   ROWS_PER_CTA =
                 (num_tokens + hypo_cluster_size - 1) / hypo_cluster_size;
             size_t global_hist_size = num_experts;
             size_t local_hist_size = num_experts;
@@ -844,13 +840,13 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size =
-                FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) * warp_size *
+                FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
                 topk;
-            size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
-            size_t topk_indices_size_int = topk_indices_size;
             size_t topk_weights_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_weights_size_int =
                 topk_weights_size * sizeof(InValType) / sizeof(int32_t);
+            size_t topk_indices_size = ROWS_PER_CTA * const_topk_padded;
+            size_t topk_indices_size_int = topk_indices_size;
             auto kernel_wrapper = &(
                 vllm::moe::fused_routing_kernel<32, const_topk, NUM_BLOCK_SIZES,
                                                 InValType, OutValType>);
@@ -935,9 +931,9 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto grid_dim = dim3(hypo_cluster_size, 1, 1);
             // recompute config
             if (cluster_size > hypo_cluster_size) {
-                rows_per_cta = (num_tokens + cluster_size - 1) / cluster_size;
+                ROWS_PER_CTA = (num_tokens + cluster_size - 1) / cluster_size;
                 local_offset_size =
-                    FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) *
+                    FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) *
                     warp_size * topk;
 
                 config.dynamicSmemBytes = compute_sm();
