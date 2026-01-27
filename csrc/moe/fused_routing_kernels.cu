@@ -54,20 +54,36 @@ __device__ void debug_cp_async_int32(const int32_t* sm_base,
 
 #define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y) - 1) / (y) * (y)) - (x))
 
-__device__ int swizzle_addr(int row, int col) {
-    constexpr int COLS = 4;  // topk
-    int elem_idx = row * COLS + col;
-
-    int block = elem_idx >> 5;
-
-    int bank = elem_idx % 32;
-
-    int swizzled_offset = bank ^ block;
-
-    return block * 32 + swizzled_offset;
-}
-
 __device__ int layout_addr(int row, int col) {
+    /*
+     * Swizzled address layout for local_offset_sm to avoid shared memory bank
+     * conflicts. Memory Layout: ┌─────────────────────── warp 0 (128 elements)
+     * ───────────────────────┐ │  col=0 (32 elem)  │  col=1 (32 elem)  │  col=2
+     * (32 elem)  │  col=3  │ │  addr: 0-31       │  addr: 32-63      │  addr:
+     * 64-95      │  96-127 │ │  row 0-31         │  row 0-31         │  row
+     * 0-31         │ row 0-31│
+     *   └──────────────────────────────────────────────────────────────────────┘
+     *   ┌─────────────────────── warp 1 (128 elements) ───────────────────────┐
+     *   │  col=0 (32 elem)  │  col=1 (32 elem)  │  col=2 (32 elem)  │  col=3  │
+     *   │  addr: 128-159    │  addr: 160-191    │  addr: 192-223    │ 224-255 │
+     *   │  row 32-63        │  row 32-63        │  row 32-63        │row 32-63│
+     *   └──────────────────────────────────────────────────────────────────────┘
+     *   ...
+     *   - warp_offset:  base address for each warp block (128 per warp)
+     *   - group_offset: offset within warp for each column (32 per column)
+     *   - elem_idx:     lane position within the column group
+     *
+     * Bank Conflict Analysis (col=0 access within one warp):
+     *   thread 0  -> addr = 0,  bank = 0
+     *   thread 1  -> addr = 1,  bank = 1
+     *   ...
+     *   thread 31 -> addr = 31, bank = 31
+     *   All 32 threads access different banks -> NO conflict
+     *
+     * Shared Memory Size:
+     *   num_warps = CEIL_DIV(rows_per_cta, 32)
+     *   local_offset_size = num_warps * 32 * topk
+     */
     constexpr int COLS = 4;  // topk
     constexpr int warp_size = 32;
     int elem_idx = row % warp_size;
@@ -77,6 +93,7 @@ __device__ int layout_addr(int row, int col) {
     int addr = warp_offset + group_offset + elem_idx;
     return addr;
 }
+
 __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
                                                  const void* glob_ptr,
                                                  bool pred = true) {
@@ -90,6 +107,7 @@ __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
         "}\n" ::"r"((int)pred),
         "r"(smem), "l"(glob_ptr));
 }
+
 __device__ __forceinline__ void cp_async_ca_pred(void* smem_ptr,
                                                  const void* glob_ptr,
                                                  bool pred = true) {
@@ -104,6 +122,7 @@ __device__ __forceinline__ void cp_async_ca_pred(void* smem_ptr,
         "}\n" ::"r"((int)pred),
         "r"(smem), "l"(glob_ptr));
 }
+
 __device__ inline void cp_async_fence() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -111,9 +130,6 @@ __device__ inline void cp_async_fence() {
 template <int n>
 __device__ inline void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
-}
-__device__ inline void cp_async_wait_all() {
-    asm volatile("cp.async.wait_all ;\n");
 }
 
 template <int NUM_EXPERTS>
@@ -248,8 +264,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     size_t local_offset_size =
-        FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
-        topk;
+        FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size * topk;
     int topk_indices_offset =
         local_offset_offset + local_offset_size + padding_indices;
     int topk_weights_offset =
@@ -312,8 +327,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     /* phase 2*/
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
-    // TODO(ijpq): we can leverage warpscan to improve this process, but need
-    // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
     prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
                                  sm_hist + expert_across_offset);
     cluster.sync();
@@ -537,8 +550,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         block_pid_offset + (NUM_BLOCK_SIZES * max_n_tiles);
     int local_offset_offset = expert_across_offset + NUM_EXPERTS;
     size_t local_offset_size =
-        FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
-        topk;
+        FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size * topk;
     int topk_indices_offset =
         local_offset_offset + local_offset_size + padding_indices;
     int topk_weights_offset =
@@ -566,20 +578,46 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int row = CTA_ID * ROWS_PER_CTA;
     int row_end = min((int64_t)(row + ROWS_PER_CTA),
                       NUM_TOKENS);  // Each CTA only processes its own rows
+
+    // prefetch
+    int gmem_it = 0, stage = 0;
+    int32_t* indices_ptr = sm_hist + topk_indices_offset;
+    int safe_row = min(row_end, row + local_tid);
+    cp_async_cg_pred(&indices_ptr[local_tid * topk],
+                     topk_indices + safe_row * topk, row + local_tid < row_end);
+    cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end;
          i += blockDim.x) {  // mem transaction = warp_size * topk *
                              // sizeof(topk_indices)
+        int local_i = i - row;
+        // int next_stage = current_stage ^ 1;
+        stage = gmem_it & 1;
+        int next_i = i + blockDim.x;
+        if (next_i < row_end) {
+            gmem_it++;
+            cp_async_cg_pred(
+                sm_hist + topk_indices_offset +
+                    (gmem_it & 1) * topk_indices_sm_size / num_stages +
+                    local_tid * topk,
+                topk_indices + next_i * topk, next_i < row_end);
+            cp_async_fence();
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
         int expt0, expt1, expt2, expt3;
         int4 expts;
         if (i >= 0 && i < NUM_TOKENS) {
-            expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
+            // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
+            expts = *reinterpret_cast<int4*>(
+                sm_hist + topk_indices_offset +
+                stage * topk_indices_sm_size / num_stages + local_tid * topk);
             expt0 = expts.x;
             expt1 = expts.y;
             expt2 = expts.z;
             expt3 = expts.w;
         }
-        int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
             local_offset_sm[layout_addr(local_i, 0)] =
                 atomicAdd(local_hist + expt0, 1);
@@ -592,6 +630,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         if (expt3 >= 0 && expt3 < NUM_EXPERTS)
             local_offset_sm[layout_addr(local_i, 3)] =
                 atomicAdd(local_hist + expt3, 1);
+        // current_stage ^= 1;
     }
     cluster.sync();
     int32_t* global_hist =
@@ -602,8 +641,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int warp_id = threadIdx.x / 32;
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
-    // TODO(ijpq): we can leverage warpscan to improve this process, but need
-    // assign warp threads into [NUM_CTAS, NUM_EXPERTS] carefully.
     prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
                                  sm_hist + expert_across_offset);
     cluster.sync();
@@ -695,30 +732,33 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     cluster.sync();
 
-    int current_stage = 0;
-
-    int safe_row = min(row_end, row + local_tid);
-    int32_t* indices_ptr = sm_hist + topk_indices_offset;
+    gmem_it = 0, stage = 0;
+    // int safe_row = min(row_end, row + local_tid);
+    // int32_t* indices_ptr = sm_hist + topk_indices_offset;
     InValDtype* weights_ptr =
         reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
+
     cp_async_ca_pred(&weights_ptr[local_tid * topk],
                      topk_weights + safe_row * topk, row + local_tid < row_end);
     cp_async_cg_pred(&indices_ptr[local_tid * topk],
                      topk_indices + safe_row * topk, row + local_tid < row_end);
     cp_async_fence();
+
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
-        int next_stage = current_stage ^ 1;
+        stage = gmem_it & 1;
         int next_i = i + blockDim.x;
         if (next_i < row_end) {
-            cp_async_ca_pred(&weights_ptr[next_stage * THREAD_PER_CTA * topk +
-                                          local_tid * topk],
-                             topk_weights + next_i * topk, next_i < row_end);
+            gmem_it++;
+            cp_async_ca_pred(
+                &weights_ptr[(gmem_it & 1) * THREAD_PER_CTA * topk +
+                             local_tid * topk],
+                topk_weights + next_i * topk, next_i < row_end);
             cp_async_cg_pred(
                 sm_hist + topk_indices_offset +
-                    next_stage * topk_indices_sm_size / num_stages +
+                    (gmem_it & 1) * topk_indices_sm_size / num_stages +
                     local_tid * topk,
                 topk_indices + next_i * topk, next_i < row_end);
             cp_async_fence();
@@ -730,13 +770,13 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
                     sm_hist + topk_indices_offset +
-                    current_stage * topk_indices_sm_size / num_stages +
+                    stage * topk_indices_sm_size / num_stages +
                     local_tid * topk_idx_stride + k);
                 // int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     // InValDtype val = topk_weights[i * topk_val_stride + k];
                     auto val = *reinterpret_cast<InValDtype*>(
-                        &weights_ptr[current_stage * THREAD_PER_CTA * topk +
+                        &weights_ptr[stage * THREAD_PER_CTA * topk +
                                      local_tid * topk + k]);
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
@@ -754,7 +794,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 }
             }
         }
-        current_stage ^= 1;
+        // current_stage ^= 1;
     }
 }
 
@@ -804,8 +844,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size =
-                FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) *
-                warp_size * topk;
+                FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) * warp_size *
+                topk;
             size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_indices_size_int = topk_indices_size;
             size_t topk_weights_size = 2 * THREAD_PER_CTA * const_topk_padded;
@@ -962,8 +1002,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
             size_t prefix_experts_size = num_experts;
             size_t local_offset_size =
-                FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) *
-                warp_size * topk;
+                FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) * warp_size *
+                topk;
             size_t topk_indices_size = 2 * THREAD_PER_CTA * const_topk_padded;
             size_t topk_indices_size_int = topk_indices_size;
             size_t topk_weights_size = 2 * THREAD_PER_CTA * const_topk_padded;
