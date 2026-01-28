@@ -631,27 +631,21 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
         int expt0, expt1, expt2, expt3;
         int4 expts;
-        if (i >= 0 && i < NUM_TOKENS) {
-            // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
-            expts = *reinterpret_cast<int4*>(
-                indices_ptr + stage * THREAD_PER_CTA * topk + local_tid * topk);
-            expt0 = expts.x;
-            expt1 = expts.y;
-            expt2 = expts.z;
-            expt3 = expts.w;
-        }
-        if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 0)] =
-                atomicAdd(local_hist + expt0, 1);
-        if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 1)] =
-                atomicAdd(local_hist + expt1, 1);
-        if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 2)] =
-                atomicAdd(local_hist + expt2, 1);
-        if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 3)] =
-                atomicAdd(local_hist + expt3, 1);
+        // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
+        expts = *reinterpret_cast<int4*>(
+            indices_ptr + stage * THREAD_PER_CTA * topk + local_tid * topk);
+        expt0 = expts.x;
+        expt1 = expts.y;
+        expt2 = expts.z;
+        expt3 = expts.w;
+        local_offset_sm[layout_addr(local_i, 0)] =
+            atomicAdd(local_hist + expt0, 1);
+        local_offset_sm[layout_addr(local_i, 1)] =
+            atomicAdd(local_hist + expt1, 1);
+        local_offset_sm[layout_addr(local_i, 2)] =
+            atomicAdd(local_hist + expt2, 1);
+        local_offset_sm[layout_addr(local_i, 3)] =
+            atomicAdd(local_hist + expt3, 1);
     }
     cluster.sync();
     int32_t* global_hist =
@@ -789,30 +783,24 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         } else {
             cp_async_wait<0>();
         }
+#pragma unroll
         for (int k = 0; k < topk; k++) {
-            if (i >= 0 && i < NUM_TOKENS) {
-                int expert_id = *reinterpret_cast<int32_t*>(
-                    indices_ptr + indices_sm_idx * THREAD_PER_CTA * topk +
-                    local_tid * topk_idx_stride + k);
-                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                    auto val = *reinterpret_cast<InValDtype*>(
-                        &weights_ptr[stage * THREAD_PER_CTA * topk +
-                                     local_tid * topk + k]);
-                    int flat_idx = i * topk + k;
-                    int expert_base = hist_sum_local[expert_id];
-                    int expert_prior = prior_contrib[expert_id];
-                    int expert_local = local_offset_sm[layout_addr(local_i, k)];
+            int expert_id = *reinterpret_cast<int32_t*>(
+                indices_ptr + indices_sm_idx * THREAD_PER_CTA * topk +
+                local_tid * topk_idx_stride + k);
+            auto val = *reinterpret_cast<InValDtype*>(
+                &weights_ptr[stage * THREAD_PER_CTA * topk + local_tid * topk +
+                             k]);
+            int flat_idx = i * topk + k;
+            int expert_base = hist_sum_local[expert_id];
+            int expert_prior = prior_contrib[expert_id];
+            int expert_local = local_offset_sm[layout_addr(local_i, k)];
 
-                    int global_pos = expert_base + expert_prior + expert_local;
+            int global_pos = expert_base + expert_prior + expert_local;
 
-                    if (global_pos < NUM_TOKENS * topk &&
-                        flat_idx < NUM_TOKENS * topk) {
-                        gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                        topk_index[global_pos] = flat_idx;
-                        gate_index[flat_idx] = global_pos;
-                    }
-                }
-            }
+            gate_scale[global_pos] = static_cast<OutValDtype>(val);
+            topk_index[global_pos] = flat_idx;
+            gate_index[flat_idx] = global_pos;
         }
     }
 }
