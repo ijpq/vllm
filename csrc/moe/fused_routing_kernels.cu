@@ -292,21 +292,42 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int row = CTA_ID * ROWS_PER_CTA;
     int row_end = min((int64_t)(row + ROWS_PER_CTA),
                       NUM_TOKENS);  // Each CTA only processes its own rows
+    // prefetch topk*THREAD_PER_CTA
+    int gmem_it = 0, stage = 0;
+    int32_t* indices_ptr = sm_hist + topk_indices_offset;
+    int safe_row = min(row_end, row + local_tid);
+    cp_async_cg_pred(&indices_ptr[local_tid * topk],
+                     topk_indices + safe_row * topk, row + local_tid < row_end);
+    cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end;
-         i += blockDim.x) {  // mem transaction = warp_size * topk *
-                             // sizeof(topk_indices)
-
+         i += THREAD_PER_CTA) {  // mem transaction = warp_size * topk *
+                                 // sizeof(topk_indices)
+        int local_i = i - row;
         int expt0, expt1, expt2, expt3;
+
+        int next_i = i + THREAD_PER_CTA;
+        stage = gmem_it;
+        if (next_i < row_end) {
+            gmem_it++;
+            cp_async_cg_pred(indices_ptr + gmem_it * THREAD_PER_CTA * topk +
+                                 local_tid * topk,
+                             topk_indices + next_i * topk, next_i < row_end);
+            cp_async_fence();
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
         int4 expts;
         if (i >= 0 && i < NUM_TOKENS) {
-            expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
+            // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
+            expts = *reinterpret_cast<int4*>(
+                indices_ptr + stage * THREAD_PER_CTA * topk + local_tid * topk);
             expt0 = expts.x;
             expt1 = expts.y;
             expt2 = expts.z;
             expt3 = expts.w;
         }
-        int local_i = i - row;
         if (expt0 >= 0 && expt0 < NUM_EXPERTS)
             local_offset_sm[layout_addr(local_i, 0)] =
                 atomicAdd(local_hist + expt0, 1);
@@ -379,6 +400,11 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             }
         }
     }
+    InValDtype* weights_ptr =
+        reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
+    cp_async_ca_pred(&weights_ptr[local_tid * topk],
+                     topk_weights + safe_row * topk, row + local_tid < row_end);
+    cp_async_fence();
     cluster.sync();
 
     // WB global memory
@@ -424,33 +450,35 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     cluster.sync();
 
-    int current_stage = 0;
     // prefetch
+    int indices_sm_idx = 0;
+    gmem_it = 0, stage = 0;
 
-    int safe_row = min(row_end, row + local_tid);
-    int32_t* indices_ptr = sm_hist + topk_indices_offset;
-    InValDtype* weights_ptr =
-        reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
-    cp_async_ca_pred(&weights_ptr[local_tid * topk],
-                     topk_weights + safe_row * topk, row + local_tid < row_end);
-    cp_async_cg_pred(&indices_ptr[local_tid * topk],
-                     topk_indices + safe_row * topk, row + local_tid < row_end);
-    cp_async_fence();
+    // cp_async_ca_pred(&weights_ptr[local_tid * topk],
+    //                  topk_weights + safe_row * topk, row + local_tid <
+    //                  row_end);
+    // cp_async_cg_pred(&indices_ptr[local_tid * topk],
+    //                  topk_indices + safe_row * topk, row + local_tid <
+    //                  row_end);
+    // cp_async_fence();
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
         int topk_idx_stride = topk, topk_val_stride = topk;
-        int next_stage = current_stage ^ 1;
+        stage = gmem_it & 1;
+        indices_sm_idx = gmem_it;
         int next_i = i + blockDim.x;
         if (next_i < row_end) {
-            cp_async_ca_pred(&weights_ptr[next_stage * THREAD_PER_CTA * topk +
-                                          local_tid * topk],
-                             topk_weights + next_i * topk, next_i < row_end);
-            cp_async_cg_pred(
-                sm_hist + topk_indices_offset +
-                    next_stage * topk_indices_sm_size / num_stages +
-                    local_tid * topk,
-                topk_indices + next_i * topk, next_i < row_end);
+            gmem_it++;
+            cp_async_ca_pred(
+                &weights_ptr[(gmem_it & 1) * THREAD_PER_CTA * topk +
+                             local_tid * topk],
+                topk_weights + next_i * topk, next_i < row_end);
+            // cp_async_cg_pred(
+            //     sm_hist + topk_indices_offset +
+            //         next_stage * topk_indices_sm_size / num_stages +
+            //         local_tid * topk,
+            //     topk_indices + next_i * topk, next_i < row_end);
             cp_async_fence();
             cp_async_wait<1>();
         } else {
@@ -459,14 +487,13 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
-                    sm_hist + topk_indices_offset +
-                    current_stage * topk_indices_sm_size / num_stages +
+                    indices_ptr + indices_sm_idx * THREAD_PER_CTA * topk +
                     local_tid * topk_idx_stride + k);
                 // int expert_id = topk_indices[i * topk_idx_stride + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     // InValDtype val = topk_weights[i * topk_val_stride + k];
                     auto val = *reinterpret_cast<InValDtype*>(
-                        &weights_ptr[current_stage * THREAD_PER_CTA * topk +
+                        &weights_ptr[stage * THREAD_PER_CTA * topk +
                                      local_tid * topk + k]);
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
@@ -484,7 +511,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 }
             }
         }
-        current_stage ^= 1;
     }
 }
 
@@ -589,17 +615,15 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 #pragma unroll
     for (int i = row + local_tid; i < row_end;
          i += THREAD_PER_CTA) {  // mem transaction = warp_size * topk *
-                             // sizeof(topk_indices)
+                                 // sizeof(topk_indices)
         int local_i = i - row;
         int next_i = i + THREAD_PER_CTA;
         stage = gmem_it;
         if (next_i < row_end) {
             gmem_it++;
-            cp_async_cg_pred(
-                indices_ptr + 
-                    gmem_it * THREAD_PER_CTA * topk +
-                    local_tid * topk,
-                topk_indices + next_i * topk, next_i < row_end);
+            cp_async_cg_pred(indices_ptr + gmem_it * THREAD_PER_CTA * topk +
+                                 local_tid * topk,
+                             topk_indices + next_i * topk, next_i < row_end);
             cp_async_fence();
             cp_async_wait<1>();
         } else {
@@ -610,8 +634,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         if (i >= 0 && i < NUM_TOKENS) {
             // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
             expts = *reinterpret_cast<int4*>(
-                indices_ptr + 
-                stage * THREAD_PER_CTA * topk + local_tid * topk);
+                indices_ptr + stage * THREAD_PER_CTA * topk + local_tid * topk);
             expt0 = expts.x;
             expt1 = expts.y;
             expt2 = expts.z;
@@ -685,6 +708,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             pid_map_row[(tile_start + block_idx)] = packed_val;
         }
     }
+    InValDtype* weights_ptr =
+        reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
+    cp_async_ca_pred(&weights_ptr[local_tid * topk],
+                     topk_weights + safe_row * topk, row + local_tid < row_end);
+    cp_async_fence();
     cluster.sync();
 
     // WB global memory
@@ -732,14 +760,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
     gmem_it = 0, stage = 0;
     int indices_sm_idx = 0;
-    InValDtype* weights_ptr =
-        reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
 
-    cp_async_ca_pred(&weights_ptr[local_tid * topk],
-                     topk_weights + safe_row * topk, row + local_tid < row_end);
     // cp_async_cg_pred(&indices_ptr[local_tid * topk],
-    //                  topk_indices + safe_row * topk, row + local_tid < row_end);
-    cp_async_fence();
+    //                  topk_indices + safe_row * topk, row + local_tid <
+    //                  row_end);
+    // cp_async_fence();
 
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
@@ -767,8 +792,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
                 int expert_id = *reinterpret_cast<int32_t*>(
-                    indices_ptr +
-                    indices_sm_idx * THREAD_PER_CTA * topk +
+                    indices_ptr + indices_sm_idx * THREAD_PER_CTA * topk +
                     local_tid * topk_idx_stride + k);
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                     auto val = *reinterpret_cast<InValDtype*>(
@@ -790,7 +814,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 }
             }
         }
-        // current_stage ^= 1;
     }
 }
 
@@ -831,7 +854,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             static constexpr int THREAD_PER_CTA = 512;
 
             int hypo_cluster_size = 8;
-            size_t   ROWS_PER_CTA =
+            size_t ROWS_PER_CTA =
                 (num_tokens + hypo_cluster_size - 1) / hypo_cluster_size;
             size_t global_hist_size = num_experts;
             size_t local_hist_size = num_experts;
