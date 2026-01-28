@@ -125,9 +125,9 @@ def fused_routing(
 
 
     # XXX: Since we have fused topk+softmax kernel, leave it outside
-    ops.topk_softmax(
-        topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
-    )
+    # ops.topk_softmax(
+    #     topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
+    # )
     topk_weights = topk_weights.to(router_logits.dtype).contiguous()  
     topk_indices = topk_indices.contiguous()
     ops.fused_routing(

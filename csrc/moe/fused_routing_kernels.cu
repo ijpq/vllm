@@ -50,9 +50,9 @@ __device__ void debug_cp_async_int32(const int32_t* sm_base,
 }
 #endif
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y)-1) / (y))
 
-#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y) - 1) / (y) * (y)) - (x))
+#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y)-1) / (y) * (y)) - (x))
 
 __device__ int layout_addr(int row, int col) {
     /*
@@ -181,12 +181,344 @@ __forceinline__ __device__ void prefix_hist_CTA(
         }
     }
 }
+// ====================== TopK Softmax Device Functions =======================
+// Fused topk + softmax computation for MoE routing
+// Supports renormalize=True, topk=4 case
+
+template <int NUM_EXPERTS, int THREADS_PER_ROW>
+__device__ __forceinline__ void compute_topk_softmax_row(
+    const __nv_bfloat16* __restrict__ router_logits_row,
+    float* __restrict__ topk_weights_out,    // output: top-4 weights (floats)
+    int32_t* __restrict__ topk_indices_out,  // output: top-4 expert indices
+    int thread_group_idx,                    // position within thread group
+    int lane_id,                             // lane within warp
+    int warp_id                              // warp id within CTA
+) {
+    constexpr int topk = 4;
+    constexpr int WARP_SIZE_LOCAL = 32;
+
+    // Each thread group processes one row
+    // THREADS_PER_ROW threads collaborate on one row of NUM_EXPERTS elements
+    static constexpr int ELTS_PER_THREAD = NUM_EXPERTS / THREADS_PER_ROW;
+
+    // Load router logits into registers and convert to float
+    float row_chunk[ELTS_PER_THREAD];
+    int first_elt = thread_group_idx * ELTS_PER_THREAD;
+
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] = __bfloat162float(router_logits_row[first_elt + i]);
+    }
+
+    // Step 1: Find max for numerical stability
+    float thread_max = row_chunk[0];
+#pragma unroll
+    for (int i = 1; i < ELTS_PER_THREAD; i++) {
+        thread_max = fmaxf(thread_max, row_chunk[i]);
+    }
+
+// Reduce max across threads in the group
+#pragma unroll
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        thread_max =
+            fmaxf(thread_max, __shfl_xor_sync(0xffffffff, thread_max, mask));
+    }
+
+    // Step 2: Compute exp(x - max) and sum
+    float row_sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] = expf(row_chunk[i] - thread_max);
+        row_sum += row_chunk[i];
+    }
+
+// Reduce sum across threads in the group
+#pragma unroll
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        row_sum += __shfl_xor_sync(0xffffffff, row_sum, mask);
+    }
+
+    // Step 3: Normalize to get softmax probabilities
+    float reciprocal_sum = 1.0f / row_sum;
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] *= reciprocal_sum;
+    }
+
+    // Step 4: Find top-4 values and indices using iterative argmax
+    static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_THREAD * THREADS_PER_ROW;
+
+    float selected_sum = 0.0f;
+
+#pragma unroll
+    for (int k_idx = 0; k_idx < topk; k_idx++) {
+        // Find local max
+        float max_val = row_chunk[0];
+        int expert = first_elt;
+
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_THREAD; i++) {
+            if (row_chunk[i] > max_val) {
+                max_val = row_chunk[i];
+                expert = first_elt + i;
+            }
+        }
+
+// Reduce across thread group using butterfly pattern
+#pragma unroll
+        for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+            float other_max = __shfl_xor_sync(0xffffffff, max_val, mask);
+            int other_expert = __shfl_xor_sync(0xffffffff, expert, mask);
+
+            // Prefer lower indices for tie-breaking
+            if (other_max > max_val ||
+                (other_max == max_val && other_expert < expert)) {
+                max_val = other_max;
+                expert = other_expert;
+            }
+        }
+
+        // Thread 0 in group writes result
+        if (thread_group_idx == 0) {
+            topk_weights_out[k_idx] = max_val;
+            topk_indices_out[k_idx] = expert;
+            selected_sum += max_val;
+        }
+
+        // Clear the winning value for next iteration
+        if (k_idx + 1 < topk) {
+            int ldg_group_for_expert = expert / COLS_PER_GROUP_LDG;
+            int thread_to_clear = (expert / ELTS_PER_THREAD) % THREADS_PER_ROW;
+
+            if (thread_group_idx == thread_to_clear) {
+                int offset_for_expert = expert % ELTS_PER_THREAD;
+                row_chunk[offset_for_expert] = -10000.0f;
+            }
+        }
+    }
+
+    // Step 5: Renormalize top-k weights to sum to 1.0
+    if (thread_group_idx == 0) {
+        float denom = (selected_sum > 0.0f) ? selected_sum : 1.0f;
+#pragma unroll
+        for (int k_idx = 0; k_idx < topk; k_idx++) {
+            topk_weights_out[k_idx] /= denom;
+        }
+    }
+}
+
+// Specialized version for 128 experts (4 threads per row, 32 elements per
+// thread)
+template <>
+__device__ __forceinline__ void compute_topk_softmax_row<128, 4>(
+    const __nv_bfloat16* __restrict__ router_logits_row,
+    float* __restrict__ topk_weights_out,
+    int32_t* __restrict__ topk_indices_out, int thread_group_idx, int lane_id,
+    int warp_id) {
+    constexpr int NUM_EXPERTS = 128;
+    constexpr int THREADS_PER_ROW = 4;
+    constexpr int topk = 4;
+    constexpr int ELTS_PER_THREAD = NUM_EXPERTS / THREADS_PER_ROW;  // 32
+
+    // Load router logits into registers and convert to float
+    float row_chunk[ELTS_PER_THREAD];
+    int first_elt = thread_group_idx * ELTS_PER_THREAD;
+
+// Vectorized load (8 bfloat16 at a time = 16 bytes)
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i += 2) {
+        __nv_bfloat162 val = *reinterpret_cast<const __nv_bfloat162*>(
+            &router_logits_row[first_elt + i]);
+        float2 f2 = __bfloat1622float2(val);
+        row_chunk[i] = f2.x;
+        row_chunk[i + 1] = f2.y;
+    }
+
+    // Step 1: Find max for numerical stability
+    float thread_max = row_chunk[0];
+#pragma unroll
+    for (int i = 1; i < ELTS_PER_THREAD; i++) {
+        thread_max = fmaxf(thread_max, row_chunk[i]);
+    }
+
+// Reduce max across 4 threads
+#pragma unroll
+    for (int mask = 2; mask > 0; mask /= 2) {
+        thread_max =
+            fmaxf(thread_max, __shfl_xor_sync(0xffffffff, thread_max, mask));
+    }
+
+    // Step 2: Compute exp(x - max) and sum
+    float row_sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] = expf(row_chunk[i] - thread_max);
+        row_sum += row_chunk[i];
+    }
+
+// Reduce sum across 4 threads
+#pragma unroll
+    for (int mask = 2; mask > 0; mask /= 2) {
+        row_sum += __shfl_xor_sync(0xffffffff, row_sum, mask);
+    }
+
+    // Step 3: Normalize to get softmax probabilities
+    float reciprocal_sum = 1.0f / row_sum;
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] *= reciprocal_sum;
+    }
+
+    // Step 4: Find top-4 values and indices using iterative argmax
+    static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_THREAD * THREADS_PER_ROW;
+
+    float selected_sum = 0.0f;
+
+#pragma unroll
+    for (int k_idx = 0; k_idx < topk; k_idx++) {
+        // Find local max
+        float max_val = row_chunk[0];
+        int expert = first_elt;
+
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_THREAD; i++) {
+            if (row_chunk[i] > max_val) {
+                max_val = row_chunk[i];
+                expert = first_elt + i;
+            }
+        }
+
+// Reduce across 4 threads using butterfly pattern
+#pragma unroll
+        for (int mask = 2; mask > 0; mask /= 2) {
+            float other_max = __shfl_xor_sync(0xffffffff, max_val, mask);
+            int other_expert = __shfl_xor_sync(0xffffffff, expert, mask);
+
+            if (other_max > max_val ||
+                (other_max == max_val && other_expert < expert)) {
+                max_val = other_max;
+                expert = other_expert;
+            }
+        }
+
+        // Thread 0 in group writes result
+        if (thread_group_idx == 0) {
+            topk_weights_out[k_idx] = max_val;
+            topk_indices_out[k_idx] = expert;
+            selected_sum += max_val;
+        }
+
+        // Clear the winning value for next iteration
+        if (k_idx + 1 < topk) {
+            int thread_to_clear = (expert / ELTS_PER_THREAD) % THREADS_PER_ROW;
+
+            if (thread_group_idx == thread_to_clear) {
+                int offset_for_expert = expert % ELTS_PER_THREAD;
+                row_chunk[offset_for_expert] = -10000.0f;
+            }
+        }
+    }
+
+    // Step 5: Renormalize top-k weights to sum to 1.0
+    if (thread_group_idx == 0) {
+        float denom = (selected_sum > 0.0f) ? selected_sum : 1.0f;
+#pragma unroll
+        for (int k_idx = 0; k_idx < topk; k_idx++) {
+            topk_weights_out[k_idx] /= denom;
+        }
+    }
+}
+
+// Specialized version for 32 experts (1 thread per row, 32 elements per thread)
+template <>
+__device__ __forceinline__ void compute_topk_softmax_row<32, 1>(
+    const __nv_bfloat16* __restrict__ router_logits_row,
+    float* __restrict__ topk_weights_out,
+    int32_t* __restrict__ topk_indices_out, int thread_group_idx, int lane_id,
+    int warp_id) {
+    constexpr int NUM_EXPERTS = 32;
+    constexpr int topk = 4;
+    constexpr int ELTS_PER_THREAD = NUM_EXPERTS;  // 32
+
+    // Load all 32 router logits into registers
+    float row_chunk[ELTS_PER_THREAD];
+
+// Vectorized load (2 bfloat16 at a time)
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i += 2) {
+        __nv_bfloat162 val =
+            *reinterpret_cast<const __nv_bfloat162*>(&router_logits_row[i]);
+        float2 f2 = __bfloat1622float2(val);
+        row_chunk[i] = f2.x;
+        row_chunk[i + 1] = f2.y;
+    }
+
+    // Step 1: Find max for numerical stability
+    float thread_max = row_chunk[0];
+#pragma unroll
+    for (int i = 1; i < ELTS_PER_THREAD; i++) {
+        thread_max = fmaxf(thread_max, row_chunk[i]);
+    }
+
+    // Step 2: Compute exp(x - max) and sum
+    float row_sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] = expf(row_chunk[i] - thread_max);
+        row_sum += row_chunk[i];
+    }
+
+    // Step 3: Normalize to get softmax probabilities
+    float reciprocal_sum = 1.0f / row_sum;
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD; i++) {
+        row_chunk[i] *= reciprocal_sum;
+    }
+
+    // Step 4: Find top-4 values and indices using iterative argmax
+    float selected_sum = 0.0f;
+
+#pragma unroll
+    for (int k_idx = 0; k_idx < topk; k_idx++) {
+        // Find max in this thread's chunk
+        float max_val = row_chunk[0];
+        int expert = 0;
+
+#pragma unroll
+        for (int i = 1; i < ELTS_PER_THREAD; i++) {
+            if (row_chunk[i] > max_val) {
+                max_val = row_chunk[i];
+                expert = i;
+            }
+        }
+
+        // Store result
+        topk_weights_out[k_idx] = max_val;
+        topk_indices_out[k_idx] = expert;
+        selected_sum += max_val;
+
+        // Clear the winning value for next iteration
+        if (k_idx + 1 < topk) {
+            row_chunk[expert] = -10000.0f;
+        }
+    }
+
+    // Step 5: Renormalize top-k weights to sum to 1.0
+    float denom = (selected_sum > 0.0f) ? selected_sum : 1.0f;
+#pragma unroll
+    for (int k_idx = 0; k_idx < topk; k_idx++) {
+        topk_weights_out[k_idx] /= denom;
+    }
+}
+
 }  // namespace fused_routing
 
 template <int NUM_EXPERTS, int topk, int NUM_BLOCK_SIZES, typename InValDtype,
           typename OutValDtype>
 __global__ void fused_routing_kernel(
-    InValDtype* __restrict__ topk_weights, int32_t* __restrict__ topk_indices,
+    const InValDtype* __restrict__ router_logits,  // [NUM_TOKENS, NUM_EXPERTS]
+    InValDtype* __restrict__ topk_weights,         // [NUM_TOKENS, topk] output
+    int32_t* __restrict__ topk_indices,            // [NUM_TOKENS, topk] output
     const int64_t max_n_tiles, const int64_t NUM_TOKENS,
     OutValDtype* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
@@ -198,11 +530,12 @@ __global__ void fused_routing_kernel(
 
 template <>
 __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
-    __nv_bfloat16* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
-    const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
-    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
-    int32_t* __restrict__ token_offs_pad_ptr,
+    const __nv_bfloat16* __restrict__ router_logits,  // [NUM_TOKENS, 128]
+    __nv_bfloat16* __restrict__ topk_weights,         // [NUM_TOKENS, 4] output
+    int32_t* __restrict__ topk_indices,               // [NUM_TOKENS, 4] output
+    const int64_t max_n_tiles, const int64_t NUM_TOKENS,
+    __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
+    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
     int padding_indices, int padding_weights) {
@@ -284,7 +617,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     }
     cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
-    /*phase 1*/
+    /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
     int32_t* local_hist =
         reinterpret_cast<int32_t*>(sm_hist + local_hist_offset);
     int32_t* local_offset_sm =
@@ -292,54 +625,66 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int row = CTA_ID * ROWS_PER_CTA;
     int row_end = min((int64_t)(row + ROWS_PER_CTA),
                       NUM_TOKENS);  // Each CTA only processes its own rows
-    // prefetch topk*THREAD_PER_CTA
-    int gmem_it = 0, stage = 0;
-    int32_t* indices_ptr = sm_hist + topk_indices_offset;
-    int safe_row = min(row_end, row + local_tid);
-    cp_async_cg_pred(&indices_ptr[local_tid * topk],
-                     topk_indices + safe_row * topk, row + local_tid < row_end);
-    cp_async_fence();
-#pragma unroll
-    for (int i = row + local_tid; i < row_end;
-         i += THREAD_PER_CTA) {  // mem transaction = warp_size * topk *
-                                 // sizeof(topk_indices)
-        int local_i = i - row;
-        int expt0, expt1, expt2, expt3;
 
-        int next_i = i + THREAD_PER_CTA;
-        stage = gmem_it;
-        if (next_i < row_end) {
-            gmem_it++;
-            cp_async_cg_pred(indices_ptr + gmem_it * THREAD_PER_CTA * topk +
-                                 local_tid * topk,
-                             topk_indices + next_i * topk, next_i < row_end);
-            cp_async_fence();
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
+    // Note: indices_ptr and weights_ptr were previously used for staging data
+    // in shared memory, but since Phase 0+1 now writes results directly to
+    // global memory and Phase 3 reads from global memory, these are no longer
+    // needed. The shared memory regions are kept for backward compatibility
+    // with the memory layout.
+
+    // For 128 experts, use 4 threads per row (32 elements each)
+    // 512 threads = 128 rows per iteration (4 threads per row)
+    constexpr int THREADS_PER_ROW_TOPK = 4;
+    constexpr int ROWS_PER_ITER = THREAD_PER_CTA / THREADS_PER_ROW_TOPK;  // 128
+
+    int lane_id = threadIdx.x % warp_size;
+    int warp_id_local = threadIdx.x / warp_size;
+    int thread_group_idx = threadIdx.x % THREADS_PER_ROW_TOPK;
+    int row_in_iter = threadIdx.x / THREADS_PER_ROW_TOPK;
+
+#pragma unroll 1
+    for (int iter_base = row; iter_base < row_end; iter_base += ROWS_PER_ITER) {
+        int current_row = iter_base + row_in_iter;
+        int local_i = current_row - row;
+        bool valid_row = (current_row < row_end);
+
+        // Temporary storage for topk results
+        float topk_weights_f[topk];
+        int32_t topk_indices_local[topk];
+
+        // CRITICAL: All threads must call compute_topk_softmax_row to avoid
+        // deadlock. The function uses __shfl_xor_sync(0xffffffff, ...) which
+        // requires all threads in the warp to participate. Invalid threads
+        // use a safe address (row 0) to avoid out-of-bounds access.
+        int safe_row = valid_row ? current_row : row;
+        compute_topk_softmax_row<NUM_EXPERTS, THREADS_PER_ROW_TOPK>(
+            router_logits + safe_row * NUM_EXPERTS, topk_weights_f,
+            topk_indices_local, thread_group_idx, lane_id, warp_id_local);
+
+        // Only valid threads write results
+        if (valid_row && thread_group_idx == 0) {
+// Write to global memory
+#pragma unroll
+            for (int k = 0; k < topk; k++) {
+                topk_weights[current_row * topk + k] =
+                    static_cast<InValDtype>(topk_weights_f[k]);
+                topk_indices[current_row * topk + k] = topk_indices_local[k];
+            }
+
+            // Note: Shared memory writes for indices_ptr removed since
+            // Phase 3 now reads directly from global memory.
+
+// Build histogram and local offsets
+#pragma unroll
+            for (int k = 0; k < topk; k++) {
+                int expert_id = topk_indices_local[k];
+                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+                    local_offset_sm[layout_addr(local_i, k)] =
+                        atomicAdd(local_hist + expert_id, 1);
+                }
+            }
         }
-        int4 expts;
-        if (i >= 0 && i < NUM_TOKENS) {
-            // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
-            expts = *reinterpret_cast<int4*>(
-                indices_ptr + stage * THREAD_PER_CTA * topk + local_tid * topk);
-            expt0 = expts.x;
-            expt1 = expts.y;
-            expt2 = expts.z;
-            expt3 = expts.w;
-        }
-        if (expt0 >= 0 && expt0 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 0)] =
-                atomicAdd(local_hist + expt0, 1);
-        if (expt1 >= 0 && expt1 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 1)] =
-                atomicAdd(local_hist + expt1, 1);
-        if (expt2 >= 0 && expt2 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 2)] =
-                atomicAdd(local_hist + expt2, 1);
-        if (expt3 >= 0 && expt3 < NUM_EXPERTS)
-            local_offset_sm[layout_addr(local_i, 3)] =
-                atomicAdd(local_hist + expt3, 1);
+        __syncthreads();  // Sync before next iteration
     }
     cluster.sync();
     int32_t* global_hist =
@@ -352,8 +697,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                                  sm_hist + expert_across_offset);
     cluster.sync();
     int h = 0;
-    int lane_id = threadIdx.x % 32;
-    int warp_id = threadIdx.x / 32;
+    // Note: lane_id and warp_id_local already defined above for topk+softmax
     if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
         int32_t* global_hist_sm0 =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
@@ -400,11 +744,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             }
         }
     }
-    InValDtype* weights_ptr =
-        reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
-    cp_async_ca_pred(&weights_ptr[local_tid * topk],
-                     topk_weights + safe_row * topk, row + local_tid < row_end);
-    cp_async_fence();
+    // topk_weights already written to global memory in Phase 0+1
     cluster.sync();
 
     // WB global memory
@@ -450,51 +790,19 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     cluster.sync();
 
-    // prefetch
-    int indices_sm_idx = 0;
-    gmem_it = 0, stage = 0;
-
-    // cp_async_ca_pred(&weights_ptr[local_tid * topk],
-    //                  topk_weights + safe_row * topk, row + local_tid <
-    //                  row_end);
-    // cp_async_cg_pred(&indices_ptr[local_tid * topk],
-    //                  topk_indices + safe_row * topk, row + local_tid <
-    //                  row_end);
-    // cp_async_fence();
+    // Phase 3: Write gate_scale, topk_index, gate_index using the computed topk
+    // results Read directly from global memory since Phase 0+1 already wrote
+    // topk_weights and topk_indices there
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
-        int topk_idx_stride = topk, topk_val_stride = topk;
-        stage = gmem_it & 1;
-        indices_sm_idx = gmem_it;
-        int next_i = i + blockDim.x;
-        if (next_i < row_end) {
-            gmem_it++;
-            cp_async_ca_pred(
-                &weights_ptr[(gmem_it & 1) * THREAD_PER_CTA * topk +
-                             local_tid * topk],
-                topk_weights + next_i * topk, next_i < row_end);
-            // cp_async_cg_pred(
-            //     sm_hist + topk_indices_offset +
-            //         next_stage * topk_indices_sm_size / num_stages +
-            //         local_tid * topk,
-            //     topk_indices + next_i * topk, next_i < row_end);
-            cp_async_fence();
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
-        }
+
+        // Load topk results from global memory
         for (int k = 0; k < topk; k++) {
             if (i >= 0 && i < NUM_TOKENS) {
-                int expert_id = *reinterpret_cast<int32_t*>(
-                    indices_ptr + indices_sm_idx * THREAD_PER_CTA * topk +
-                    local_tid * topk_idx_stride + k);
-                // int expert_id = topk_indices[i * topk_idx_stride + k];
+                int expert_id = topk_indices[i * topk + k];
                 if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                    // InValDtype val = topk_weights[i * topk_val_stride + k];
-                    auto val = *reinterpret_cast<InValDtype*>(
-                        &weights_ptr[stage * THREAD_PER_CTA * topk +
-                                     local_tid * topk + k]);
+                    InValDtype val = topk_weights[i * topk + k];
                     int flat_idx = i * topk + k;
                     int expert_base = hist_sum_local[expert_id];
                     int expert_prior = prior_contrib[expert_id];
@@ -516,11 +824,12 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
 template <>
 __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
-    __nv_bfloat16* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_indices, const int64_t max_n_tiles,
-    const int64_t NUM_TOKENS, __nv_bfloat16* __restrict__ gate_scale,
-    int32_t* __restrict__ topk_index, int32_t* __restrict__ gate_index,
-    int32_t* __restrict__ token_offs_pad_ptr,
+    const __nv_bfloat16* __restrict__ router_logits,  // [NUM_TOKENS, 32]
+    __nv_bfloat16* __restrict__ topk_weights,         // [NUM_TOKENS, 4] output
+    int32_t* __restrict__ topk_indices,               // [NUM_TOKENS, 4] output
+    const int64_t max_n_tiles, const int64_t NUM_TOKENS,
+    __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
+    int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
     int padding_indices, int padding_weights) {
@@ -596,7 +905,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     }
     cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
-    /*===================================phase 1*/
+    /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
     int32_t* local_hist =
         reinterpret_cast<int32_t*>(sm_hist + local_hist_offset);
     int32_t* local_offset_sm =
@@ -605,47 +914,57 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int row_end = min((int64_t)(row + ROWS_PER_CTA),
                       NUM_TOKENS);  // Each CTA only processes its own rows
 
-    // prefetch topk*THREAD_PER_CTA
-    int gmem_it = 0, stage = 0;
-    int32_t* indices_ptr = sm_hist + topk_indices_offset;
-    int safe_row = min(row_end, row + local_tid);
-    cp_async_cg_pred(&indices_ptr[local_tid * topk],
-                     topk_indices + safe_row * topk, row + local_tid < row_end);
-    cp_async_fence();
+    // Note: indices_ptr removed since Phase 3 reads directly from global
+    // memory.
+
+    // For 32 experts, use 1 thread per row (each thread handles all 32 experts)
+    // 512 threads = 512 rows per iteration
+    constexpr int THREADS_PER_ROW_TOPK = 1;
+    constexpr int ROWS_PER_ITER = THREAD_PER_CTA / THREADS_PER_ROW_TOPK;  // 512
+
+    int lane_id = threadIdx.x % warp_size;
+    int warp_id_local = threadIdx.x / warp_size;
+    int thread_group_idx = 0;  // For 32 experts, each thread works alone
+    int row_in_iter = threadIdx.x;
+
+#pragma unroll 1
+    for (int iter_base = row; iter_base < row_end; iter_base += ROWS_PER_ITER) {
+        int current_row = iter_base + row_in_iter;
+        int local_i = current_row - row;
+
+        // Temporary storage for topk results
+        float topk_weights_f[topk];
+        int32_t topk_indices_local[topk];
+
+        if (current_row < row_end) {
+            // Compute topk+softmax for this row (each thread handles one row
+            // independently)
+            compute_topk_softmax_row<NUM_EXPERTS, THREADS_PER_ROW_TOPK>(
+                router_logits + current_row * NUM_EXPERTS, topk_weights_f,
+                topk_indices_local, thread_group_idx, lane_id, warp_id_local);
+
+// Write to global memory
 #pragma unroll
-    for (int i = row + local_tid; i < row_end;
-         i += THREAD_PER_CTA) {  // mem transaction = warp_size * topk *
-                                 // sizeof(topk_indices)
-        int local_i = i - row;
-        int next_i = i + THREAD_PER_CTA;
-        stage = gmem_it;
-        if (next_i < row_end) {
-            gmem_it++;
-            cp_async_cg_pred(indices_ptr + gmem_it * THREAD_PER_CTA * topk +
-                                 local_tid * topk,
-                             topk_indices + next_i * topk, next_i < row_end);
-            cp_async_fence();
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
+            for (int k = 0; k < topk; k++) {
+                topk_weights[current_row * topk + k] =
+                    static_cast<InValDtype>(topk_weights_f[k]);
+                topk_indices[current_row * topk + k] = topk_indices_local[k];
+            }
+
+            // Note: Shared memory writes for indices_ptr removed since
+            // Phase 3 now reads directly from global memory.
+
+// Build histogram and local offsets
+#pragma unroll
+            for (int k = 0; k < topk; k++) {
+                int expert_id = topk_indices_local[k];
+                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+                    local_offset_sm[layout_addr(local_i, k)] =
+                        atomicAdd(local_hist + expert_id, 1);
+                }
+            }
         }
-        int expt0, expt1, expt2, expt3;
-        int4 expts;
-        // expts = *reinterpret_cast<int4*>(topk_indices + i * topk);
-        expts = *reinterpret_cast<int4*>(
-            indices_ptr + stage * THREAD_PER_CTA * topk + local_tid * topk);
-        expt0 = expts.x;
-        expt1 = expts.y;
-        expt2 = expts.z;
-        expt3 = expts.w;
-        local_offset_sm[layout_addr(local_i, 0)] =
-            atomicAdd(local_hist + expt0, 1);
-        local_offset_sm[layout_addr(local_i, 1)] =
-            atomicAdd(local_hist + expt1, 1);
-        local_offset_sm[layout_addr(local_i, 2)] =
-            atomicAdd(local_hist + expt2, 1);
-        local_offset_sm[layout_addr(local_i, 3)] =
-            atomicAdd(local_hist + expt3, 1);
+        __syncthreads();  // Sync before next iteration
     }
     cluster.sync();
     int32_t* global_hist =
@@ -702,11 +1021,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             pid_map_row[(tile_start + block_idx)] = packed_val;
         }
     }
-    InValDtype* weights_ptr =
-        reinterpret_cast<InValDtype*>(sm_hist + topk_weights_offset);
-    cp_async_ca_pred(&weights_ptr[local_tid * topk],
-                     topk_weights + safe_row * topk, row + local_tid < row_end);
-    cp_async_fence();
+    // topk_weights already written to global memory in Phase 0+1
     cluster.sync();
 
     // WB global memory
@@ -752,55 +1067,28 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     cluster.sync();
 
-    gmem_it = 0, stage = 0;
-    int indices_sm_idx = 0;
-
-    // cp_async_cg_pred(&indices_ptr[local_tid * topk],
-    //                  topk_indices + safe_row * topk, row + local_tid <
-    //                  row_end);
-    // cp_async_fence();
-
+    // Phase 3: Write gate_scale, topk_index, gate_index using the computed topk
+    // results Read directly from global memory since Phase 0+1 already wrote
+    // topk_weights and topk_indices there
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
-        int topk_idx_stride = topk, topk_val_stride = topk;
-        stage = gmem_it & 1;
-        indices_sm_idx = gmem_it;
-        int next_i = i + blockDim.x;
-        if (next_i < row_end) {
-            gmem_it++;
-            cp_async_ca_pred(
-                &weights_ptr[(gmem_it & 1) * THREAD_PER_CTA * topk +
-                             local_tid * topk],
-                topk_weights + next_i * topk, next_i < row_end);
-            // cp_async_cg_pred(
-            //     sm_hist + topk_indices_offset +
-            //         (gmem_it & 1) * topk_indices_sm_size / num_stages +
-            //         local_tid * topk,
-            //     topk_indices + next_i * topk, next_i < row_end);
-            cp_async_fence();
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
-        }
-#pragma unroll
+
         for (int k = 0; k < topk; k++) {
-            int expert_id = *reinterpret_cast<int32_t*>(
-                indices_ptr + indices_sm_idx * THREAD_PER_CTA * topk +
-                local_tid * topk_idx_stride + k);
-            auto val = *reinterpret_cast<InValDtype*>(
-                &weights_ptr[stage * THREAD_PER_CTA * topk + local_tid * topk +
-                             k]);
-            int flat_idx = i * topk + k;
-            int expert_base = hist_sum_local[expert_id];
-            int expert_prior = prior_contrib[expert_id];
-            int expert_local = local_offset_sm[layout_addr(local_i, k)];
+            int expert_id = topk_indices[i * topk + k];
+            if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+                InValDtype val = topk_weights[i * topk + k];
+                int flat_idx = i * topk + k;
+                int expert_base = hist_sum_local[expert_id];
+                int expert_prior = prior_contrib[expert_id];
+                int expert_local = local_offset_sm[layout_addr(local_i, k)];
 
-            int global_pos = expert_base + expert_prior + expert_local;
+                int global_pos = expert_base + expert_prior + expert_local;
 
-            gate_scale[global_pos] = static_cast<OutValDtype>(val);
-            topk_index[global_pos] = flat_idx;
-            gate_index[flat_idx] = global_pos;
+                gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                topk_index[global_pos] = flat_idx;
+                gate_index[flat_idx] = global_pos;
+            }
         }
     }
 }
@@ -975,6 +1263,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 at::cuda::getCurrentCUDAStream();
             config.stream = current_stream;
 
+            auto router_logits_ptr =
+                reinterpret_cast<const InValType*>(gating_output.data_ptr());
             auto topk_weights_ptr =
                 reinterpret_cast<InValType*>(topk_weights.data_ptr());
             auto gate_scale_ptr =
@@ -987,11 +1277,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaLaunchKernelEx(
-                &config, kernel_wrapper, topk_weights_ptr, topk_indices_ptr,
-                max_n_tiles, num_tokens, gate_scale_ptr, topk_index_ptr,
-                gate_index_ptr, token_offs_pad_ptr, block_pid_map_ptr,
-                expt_offs_ptr, hist_ptr, padding_indices, padding_weights);
+            cudaLaunchKernelEx(&config, kernel_wrapper, router_logits_ptr,
+                               topk_weights_ptr, topk_indices_ptr, max_n_tiles,
+                               num_tokens, gate_scale_ptr, topk_index_ptr,
+                               gate_index_ptr, token_offs_pad_ptr,
+                               block_pid_map_ptr, expt_offs_ptr, hist_ptr,
+                               padding_indices, padding_weights);
             break;
         }
         case 128: {
@@ -1133,6 +1424,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                 at::cuda::getCurrentCUDAStream();
             config.stream = current_stream;
 
+            auto router_logits_ptr =
+                reinterpret_cast<const InValType*>(gating_output.data_ptr());
             auto topk_weights_ptr =
                 reinterpret_cast<InValType*>(topk_weights.data_ptr());
             auto gate_scale_ptr =
@@ -1145,11 +1438,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaLaunchKernelEx(
-                &config, kernel_wrapper, topk_weights_ptr, topk_indices_ptr,
-                max_n_tiles, num_tokens, gate_scale_ptr, topk_index_ptr,
-                gate_index_ptr, token_offs_pad_ptr, block_pid_map_ptr,
-                expt_offs_ptr, hist_ptr, padding_indices, padding_weights);
+            cudaLaunchKernelEx(&config, kernel_wrapper, router_logits_ptr,
+                               topk_weights_ptr, topk_indices_ptr, max_n_tiles,
+                               num_tokens, gate_scale_ptr, topk_index_ptr,
+                               gate_index_ptr, token_offs_pad_ptr,
+                               block_pid_map_ptr, expt_offs_ptr, hist_ptr,
+                               padding_indices, padding_weights);
             break;
         }
             TORCH_CHECK(false, "Unsupported num experts: ", num_experts);
