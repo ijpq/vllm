@@ -872,7 +872,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ __align__(16) int32_t sm_hist[];
     int topk_indices_sm_size = topk_padded * ROWS_PER_CTA;
-    int topk_weights_sm_size = num_stages * topk_padded * THREAD_PER_CTA *
+    int topk_weights_sm_size = topk_padded * ROWS_PER_CTA *
                                sizeof(InValDtype) / sizeof(int32_t);
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
@@ -891,7 +891,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int topk_weights_offset =
         topk_indices_offset + topk_indices_sm_size + padding_weights;
     int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
-    __nv_bfloat16* topk_weights_ptr = sm_hist + topk_weights_offset;
+    __nv_bfloat16* topk_weights_ptr = reinterpret_cast<__nv_bfloat16*>(sm_hist + topk_weights_offset);
     int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
 
 #pragma unroll
