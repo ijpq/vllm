@@ -891,6 +891,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int topk_weights_offset =
         topk_indices_offset + topk_indices_sm_size + padding_weights;
     int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
+    __nv_bfloat16* topk_weights_ptr = sm_hist + topk_weights_offset;
+    int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
 
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
@@ -926,7 +928,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int warp_id_local = threadIdx.x / warp_size;
     int thread_group_idx = 0;  // For 32 experts, each thread works alone
     int row_in_iter = threadIdx.x;
-
 #pragma unroll 1
     for (int iter_base = row; iter_base < row_end; iter_base += ROWS_PER_ITER) {
         int current_row = iter_base + row_in_iter;
@@ -943,12 +944,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 router_logits + current_row * NUM_EXPERTS, topk_weights_f,
                 topk_indices_local, thread_group_idx, lane_id, warp_id_local);
 
-// Write to global memory
 #pragma unroll
             for (int k = 0; k < topk; k++) {
-                topk_weights[current_row * topk + k] =
+                topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices[current_row * topk + k] = topk_indices_local[k];
+                topk_indices_ptr[local_i * topk + k] = topk_indices_local[k];
             }
 
             // Note: Shared memory writes for indices_ptr removed since
@@ -958,10 +958,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 #pragma unroll
             for (int k = 0; k < topk; k++) {
                 int expert_id = topk_indices_local[k];
-                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                    local_offset_sm[layout_addr(local_i, k)] =
-                        atomicAdd(local_hist + expert_id, 1);
-                }
+                local_offset_sm[layout_addr(local_i, k)] =
+                    atomicAdd(local_hist + expert_id, 1);
             }
         }
         __syncthreads();  // Sync before next iteration
@@ -1075,9 +1073,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         int local_i = i - row;
 
         for (int k = 0; k < topk; k++) {
-            int expert_id = topk_indices[i * topk + k];
+            int expert_id = topk_indices_ptr[local_i * topk + k];
             if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                InValDtype val = topk_weights[i * topk + k];
+                InValDtype val = topk_weights_ptr[local_i * topk + k];
                 int flat_idx = i * topk + k;
                 int expert_base = hist_sum_local[expert_id];
                 int expert_prior = prior_contrib[expert_id];
@@ -1141,7 +1139,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             size_t local_offset_size =
                 FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
                 topk;
-            size_t topk_weights_size = 2 * THREAD_PER_CTA * const_topk_padded;
+            size_t topk_weights_size = ROWS_PER_CTA * const_topk_padded;
             size_t topk_weights_size_int =
                 topk_weights_size * sizeof(InValType) / sizeof(int32_t);
             size_t topk_indices_size = ROWS_PER_CTA * const_topk_padded;
