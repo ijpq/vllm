@@ -1218,35 +1218,28 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
             // int grid_size = min((int)(numSMs * numBlocksPerSM),
             // (int)num_tokens); grid_size = max(grid_size, 1);  // At least 1
             // block
-            int grid_size = numSMs;
-
-            size_t ROWS_PER_CTA = (num_tokens + grid_size - 1) / grid_size;
-            size_t global_hist_size = num_experts;
-            size_t local_hist_size = num_experts;
-            size_t global_hist_prefix_size = num_experts + 1;
-            size_t token_offs_pad_size = NUM_BLOCK_SIZES * (num_experts + 1);
-            size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
-            size_t prefix_experts_size = num_experts;
-            size_t local_offset_size =
-                FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
-                topk;
-            size_t topk_weights_size = ROWS_PER_CTA * const_topk_padded;
-            size_t topk_weights_size_int =
-                topk_weights_size * sizeof(InValType) / sizeof(int32_t);
-            size_t topk_indices_size = ROWS_PER_CTA * const_topk_padded;
-            size_t topk_indices_size_int = topk_indices_size;
-
-            // cudaFuncAttributes attr;
-            // cudaLaunchConfig_t config = {};
-            // auto cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
-            // TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
-            // size_t static_smem_size = attr.sharedSizeBytes;
-
+            // NEW: Encapsulate smem calculation dependent on rows_per_cta
             int padding_indices, padding_weights;
             size_t requried_sm_size, fixed_sm_size;
             int alignment_indices = 16;
             int alignment_weights = 8;
-            auto compute_sm = [&]() -> size_t {
+            auto compute_sm_for_rows = [&](size_t rows_per_cta) -> size_t {
+                size_t global_hist_size = num_experts;
+                size_t local_hist_size = num_experts;
+                size_t global_hist_prefix_size = num_experts + 1;
+                size_t token_offs_pad_size =
+                    NUM_BLOCK_SIZES * (num_experts + 1);
+                size_t block_pid_size = NUM_BLOCK_SIZES * (max_n_tiles);
+                size_t prefix_experts_size = num_experts;
+                size_t local_offset_size =
+                    FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) *
+                    warp_size * topk;
+                size_t topk_weights_size = rows_per_cta * const_topk_padded;
+                size_t topk_weights_size_int =
+                    topk_weights_size * sizeof(InValType) / sizeof(int32_t);
+                size_t topk_indices_size = rows_per_cta * const_topk_padded;
+                size_t topk_indices_size_int = topk_indices_size;
+
                 fixed_sm_size = global_hist_size + local_hist_size +
                                 global_hist_prefix_size + token_offs_pad_size +
                                 block_pid_size + prefix_experts_size +
@@ -1271,7 +1264,60 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                 requried_sm_size = required_dynamicSmemBytes;
                 return required_dynamicSmemBytes;
             };
-            // config.dynamicSmemBytes = compute_sm();
+
+            // Calculate max possible blocks per SM (theoretical limit)
+            int max_active_blocks_per_sm = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &max_active_blocks_per_sm, kernel_wrapper, THREAD_PER_CTA, 0);
+
+            int grid_size = numSMs;
+            size_t final_smem = 0;
+
+            // Iterate down from max possible blocks per SM to find optimal grid
+            // size We want the largest grid_size that is supported (occupancy
+            // >= requested) because larger grid_size -> fewer rows per CTA ->
+            // less smem per block -> more likely to fit. AND user asked for
+            // "max CTA count".
+            bool found = false;
+            for (int k = max_active_blocks_per_sm; k >= 1; k--) {
+                int trial_grid_size = k * numSMs;
+                if (trial_grid_size > num_tokens) trial_grid_size = num_tokens;
+
+                size_t trial_rows =
+                    (num_tokens + trial_grid_size - 1) / trial_grid_size;
+                size_t trial_smem = compute_sm_for_rows(trial_rows);
+
+                if (trial_smem > max_hw_limit) continue;
+
+                int active_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active_per_sm, kernel_wrapper, THREAD_PER_CTA, trial_smem);
+
+                if (active_per_sm >= k) {
+                    grid_size = trial_grid_size;
+                    final_smem = trial_smem;
+                    found = true;
+#if KERNEL_DEBUG
+                    std::cout << "Selected grid_size=" << grid_size
+                              << " (k=" << k << ")" << " smem=" << final_smem
+                              << std::endl;
+#endif
+                    break;
+                }
+            }
+
+            if (!found) {
+                // Fallback to numSMs or minimal, let it crash or try 1 block
+                grid_size = numSMs;
+                size_t rows = (num_tokens + grid_size - 1) / grid_size;
+                final_smem = compute_sm_for_rows(rows);
+            }
+
+            // Re-run compute_sm to set padding variables correctly for the
+            // chosen grid_size
+            compute_sm_for_rows((num_tokens + grid_size - 1) / grid_size);
+
+            size_t ROWS_PER_CTA = (num_tokens + grid_size - 1) / grid_size;
 
             // dev id
             // int dev_id = 0;
@@ -1365,7 +1411,8 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
             int32_t* hist_prefix;
             cudaMalloc(&prior_contrib,
                        grid_dim.x * num_experts * sizeof(int32_t));
-            cudaMalloc(&hist_prefix, (num_experts + 1) * sizeof(int32_t));
+            cudaMalloc(&hist_prefix,
+                       grid_dim.x * num_experts * sizeof(int32_t));
             void* args[] = {
                 (void*)&router_logits_ptr,  (void*)&max_n_tiles,
                 (void*)&num_tokens,         (void*)&gate_scale_ptr,
@@ -1374,9 +1421,9 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                 (void*)&expt_offs_ptr,      (void*)&hist_ptr,
                 (void*)&prior_contrib,      (void*)&hist_prefix,
                 (void*)&padding_indices,    (void*)&padding_weights};
-            cudaLaunchCooperativeKernel((void*)kernel_wrapper, grid_dim,
-                                        block_dim, args, compute_sm(),
-                                        current_stream);
+            cudaLaunchCooperativeKernel(
+                (void*)kernel_wrapper, grid_dim, block_dim, args,
+                compute_sm_for_rows(ROWS_PER_CTA), current_stream);
             cudaStreamSynchronize(current_stream);
             cudaFree(prior_contrib);
             cudaFree(hist_prefix);
