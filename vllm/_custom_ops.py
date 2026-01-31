@@ -3058,8 +3058,6 @@ if hasattr(torch.ops._C, "hadacore_transform"):
 
 def fused_routing(
     gating_output,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     max_n_tiles,
     topk,
     gate_scale,
@@ -3072,8 +3070,6 @@ def fused_routing(
 ) -> None:
     torch.ops._moe_C.fused_routing(
     gating_output,
-    topk_weights,
-    topk_ids,
     max_n_tiles,
     topk,
     gate_scale,

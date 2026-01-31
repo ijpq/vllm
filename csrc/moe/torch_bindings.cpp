@@ -9,8 +9,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
   m.def(
-      "fused_routing(Tensor router_logits, Tensor! topk_weights, Tensor! "
-      "topk_indices, int max_n_tiles, int topk,"
+      "fused_routing(Tensor router_logits, int max_n_tiles, int topk,"
       " Tensor! gate_scale, Tensor! topk_index,"
       "Tensor! gate_index, Tensor! token_offs_pad, Tensor! block_pid_map, "
       "Tensor! expt_offs, Tensor! hist) -> ()");

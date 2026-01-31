@@ -132,8 +132,6 @@ def fused_routing(
     topk_indices = topk_indices.contiguous()
     ops.fused_routing(
         router_logits,
-        topk_weights,
-        topk_indices,
         max_n_tiles,
         topk,
         gate_scale,
