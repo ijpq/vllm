@@ -50,9 +50,9 @@ __device__ void debug_cp_async_int32(const int32_t* sm_base,
 }
 #endif
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y)-1) / (y))
 
-#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y) - 1) / (y) * (y)) - (x))
+#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y)-1) / (y) * (y)) - (x))
 
 __device__ int layout_addr(int row, int col) {
     /*
@@ -144,7 +144,12 @@ __forceinline__ __device__ void _collect_hist(
     handle.sync();
 
     // CTA 0 copies the aggregated global histogram to its shared memory
-    if (blockIdx.x == 0 && tid < NUM_EXPERTS) global_hist[tid] = hist_ptr[tid];
+    int num_steps = NUM_EXPERTS / 4;
+    if (blockIdx.x == 0) {
+        if (tid < num_steps)
+            *reinterpret_cast<int4*>(global_hist + tid * 4) =
+                *reinterpret_cast<int4*>(hist_ptr + tid * 4);
+    }
 }
 
 template <int NUM_EXPERTS>
@@ -922,9 +927,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     __shared__
         typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ __align__(16) int32_t sm_hist[];
-    int topk_indices_sm_size =
-        FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
-        topk_padded;
+    int topk_indices_sm_size = FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) *
+                               warp_size * topk_padded;
     int topk_weights_sm_size =
         topk_padded * ROWS_PER_CTA * sizeof(InValDtype) / sizeof(int32_t);
     int global_hist_offset = 0;
@@ -1005,7 +1009,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 // (TODO)2 way bank conflict
                 topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices_ptr[layout_addr(local_i, k)] = topk_indices_local[k];
+                topk_indices_ptr[layout_addr(local_i, k)] =
+                    topk_indices_local[k];
             }
 
             // Note: Shared memory writes for indices_ptr removed since
@@ -1357,9 +1362,11 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
             int32_t* prior_contrib;
             int32_t* hist_prefix;
             cudaMallocAsync(&prior_contrib,
-                       grid_dim.x * num_experts * sizeof(int32_t), current_stream);
+                            grid_dim.x * num_experts * sizeof(int32_t),
+                            current_stream);
             cudaMallocAsync(&hist_prefix,
-                       grid_dim.x * num_experts * sizeof(int32_t), current_stream);
+                            grid_dim.x * num_experts * sizeof(int32_t),
+                            current_stream);
 
             void* args[] = {
                 (void*)&router_logits_ptr,  (void*)&max_n_tiles,
@@ -1370,9 +1377,9 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                 (void*)&prior_contrib,      (void*)&hist_prefix,
                 (void*)&padding_indices,    (void*)&padding_weights};
 
-             cudaLaunchCooperativeKernel(
-                (void*)kernel_wrapper, grid_dim, block_dim, args, smem_bytes,
-                current_stream);
+            cudaLaunchCooperativeKernel((void*)kernel_wrapper, grid_dim,
+                                        block_dim, args, smem_bytes,
+                                        current_stream);
             // TORCH_CHECK(cuda_error == cudaSuccess,
             //             "cudaLaunchCooperativeKernel failed: ",
             //             cudaGetErrorString(cuda_error));
