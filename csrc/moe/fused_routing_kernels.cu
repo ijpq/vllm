@@ -1180,9 +1180,12 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
                 int global_pos = expert_base + expert_prior + expert_local;
 
-                gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                topk_index[global_pos] = flat_idx;
-                gate_index[flat_idx] = global_pos;
+                __stcs(gate_scale + global_pos, static_cast<OutValDtype>(val)); 
+                __stcs(topk_index + global_pos, flat_idx);
+                __stcs(gate_index + flat_idx, global_pos);
+                // gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                // topk_index[global_pos] = flat_idx;
+                // gate_index[flat_idx] = global_pos;
             }
         }
     }
