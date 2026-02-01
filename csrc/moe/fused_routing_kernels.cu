@@ -1197,32 +1197,22 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
             auto warp_size = 32;
             static constexpr int THREAD_PER_CTA = 512;
 
-            // max sm size
             int max_hw_limit = 0, dev = 0;
-            auto cuda_error = cudaDeviceGetAttribute(
+            cudaDeviceGetAttribute(
                 &max_hw_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
             cudaDeviceProp deviceProp;
             cudaGetDeviceProperties(&deviceProp, dev);
             int numSMs = deviceProp.multiProcessorCount;
+
             auto kernel_wrapper = &(
                 vllm::moe::fused_routing_kernel<32, const_topk, NUM_BLOCK_SIZES,
                                                 InValType, OutValType>);
-            // int numBlocksPerSM = 0;
-            // cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            //     &numBlocksPerSM,
-            //     kernel_wrapper,
-            //     THREAD_PER_CTA,
-            //     max_hw_limit
-            // );
-            // Limit grid size to ensure at least 1 row per CTA
-            // int grid_size = min((int)(numSMs * numBlocksPerSM),
-            // (int)num_tokens); grid_size = max(grid_size, 1);  // At least 1
-            // block
-            // NEW: Encapsulate smem calculation dependent on rows_per_cta
+
             int padding_indices, padding_weights;
-            size_t requried_sm_size, fixed_sm_size;
+            size_t fixed_sm_size;
             int alignment_indices = 16;
             int alignment_weights = 8;
+
             auto compute_sm_for_rows = [&](size_t rows_per_cta) -> size_t {
                 size_t global_hist_size = num_experts;
                 size_t local_hist_size = num_experts;
@@ -1243,11 +1233,10 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                 fixed_sm_size = global_hist_size + local_hist_size +
                                 global_hist_prefix_size + token_offs_pad_size +
                                 block_pid_size + prefix_experts_size +
-                                local_offset_size;  // 4B unit
-                // make sm size align to 16
+                                local_offset_size;
+
                 size_t padding_before_indices_bytes = MAKE_ALIGNMENT_DIFF(
                     fixed_sm_size * sizeof(int32_t), alignment_indices);
-
                 padding_indices = FUSED_ROUTING_CEIL_DIV(
                     padding_before_indices_bytes, sizeof(int32_t));
 
@@ -1257,147 +1246,102 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                     alignment_weights);
                 padding_weights = FUSED_ROUTING_CEIL_DIV(
                     padding_before_weights_bytes, sizeof(int32_t));
+
                 size_t required_dynamicSmemBytes =
                     (fixed_sm_size + padding_indices + topk_indices_size_int +
                      padding_weights + topk_weights_size_int) *
                     sizeof(int32_t);
-                requried_sm_size = required_dynamicSmemBytes;
                 return required_dynamicSmemBytes;
             };
 
-            // Calculate max possible blocks per SM (theoretical limit)
-            int max_active_blocks_per_sm = 0;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &max_active_blocks_per_sm, kernel_wrapper, THREAD_PER_CTA, 0);
-
             int grid_size = numSMs;
-            size_t final_smem = 0;
+            size_t ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(num_tokens, grid_size);
+            size_t smem_bytes = compute_sm_for_rows(ROWS_PER_CTA);
 
-            // Iterate down from max possible blocks per SM to find optimal grid
-            // size We want the largest grid_size that is supported (occupancy
-            // >= requested) because larger grid_size -> fewer rows per CTA ->
-            // less smem per block -> more likely to fit. AND user asked for
-            // "max CTA count".
-            bool found = false;
-            for (int k = max_active_blocks_per_sm; k >= 1; k--) {
-                int trial_grid_size = k * numSMs;
-                if (trial_grid_size > num_tokens) trial_grid_size = num_tokens;
+            while (smem_bytes > (size_t)max_hw_limit &&
+                   grid_size < num_tokens) {
+                grid_size *= 2;
+                ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(num_tokens, grid_size);
+                smem_bytes = compute_sm_for_rows(ROWS_PER_CTA);
+            }
+            TORCH_CHECK(smem_bytes <= (size_t)max_hw_limit,
+                        "Shared memory requirement (", smem_bytes,
+                        " bytes) exceeds hardware limit (", max_hw_limit,
+                        " bytes)");
 
-                size_t trial_rows =
-                    (num_tokens + trial_grid_size - 1) / trial_grid_size;
-                size_t trial_smem = compute_sm_for_rows(trial_rows);
+            constexpr int MAX_ITERATIONS = 5;
+            for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+                auto cuda_error = cudaFuncSetAttribute(
+                    kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    smem_bytes);
+                TORCH_CHECK(cuda_error == cudaSuccess,
+                            "cudaFuncSetAttribute failed: ",
+                            cudaGetErrorString(cuda_error));
 
-                if (trial_smem > max_hw_limit) continue;
+                int numBlocksPerSM = 0;
+                cuda_error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &numBlocksPerSM, kernel_wrapper, THREAD_PER_CTA,
+                    smem_bytes);
+                TORCH_CHECK(
+                    cuda_error == cudaSuccess,
+                    "cudaOccupancyMaxActiveBlocksPerMultiprocessor failed: ",
+                    cudaGetErrorString(cuda_error));
+                TORCH_CHECK(numBlocksPerSM > 0,
+                            "Kernel cannot achieve any occupancy with smem=",
+                            smem_bytes);
 
-                int active_per_sm = 0;
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &active_per_sm, kernel_wrapper, THREAD_PER_CTA, trial_smem);
+                int max_coop_grid = numSMs * numBlocksPerSM;
+                int new_grid_size = std::min(max_coop_grid, (int)num_tokens);
+                new_grid_size = std::max(new_grid_size, 1);
 
-                if (active_per_sm >= k) {
-                    grid_size = trial_grid_size;
-                    final_smem = trial_smem;
-                    found = true;
+                if (new_grid_size == grid_size) {
 #if KERNEL_DEBUG
-                    std::cout << "Selected grid_size=" << grid_size
-                              << " (k=" << k << ")" << " smem=" << final_smem
-                              << std::endl;
+                    std::cout << "Converged at iteration " << iter
+                              << ", grid_size=" << grid_size << std::endl;
 #endif
                     break;
                 }
-            }
 
-            if (!found) {
-                // Fallback to numSMs or minimal, let it crash or try 1 block
-                grid_size = numSMs;
-                size_t rows = (num_tokens + grid_size - 1) / grid_size;
-                final_smem = compute_sm_for_rows(rows);
-            }
+                grid_size = new_grid_size;
+                ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(num_tokens, grid_size);
+                smem_bytes = compute_sm_for_rows(ROWS_PER_CTA);
 
-            // Re-run compute_sm to set padding variables correctly for the
-            // chosen grid_size
-            compute_sm_for_rows((num_tokens + grid_size - 1) / grid_size);
-
-            size_t ROWS_PER_CTA = (num_tokens + grid_size - 1) / grid_size;
-
-            // dev id
-            // int dev_id = 0;
-            // cuda_error = cudaGetDevice(&dev_id);
-            // TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error));
-
-            // TORCH_CHECK(requried_sm_size <= max_hw_limit,
-            //             cudaGetErrorString(cuda_error));
-
-            // cuda_error = cudaFuncSetAttribute(
-            //     kernel_wrapper, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            //     config.dynamicSmemBytes);
-            // TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-
-            // cuda_error = cudaFuncSetAttribute(
-            //     kernel_wrapper,
-            //     cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-            // TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-
-            // cuda_error = cudaFuncGetAttributes(&attr, kernel_wrapper);
-            // TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-            // cuda_error = cudaOccupancyMaxPotentialClusterSize(
-            //     &cluster_size, kernel_wrapper, &config);
-            // TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
 #if KERNEL_DEBUG
-            std::cout << "  binaryVersion: " << attr.binaryVersion << std::endl;
-            std::cout << "  maxDynamicSharedSizeBytes: "
-                      << attr.maxDynamicSharedSizeBytes << std::endl;
-            std::cout << "  sharedSizeBytes: " << attr.sharedSizeBytes
-                      << std::endl;
-            std::cout << "cluster size: " << cluster_size << std::endl;
-            std::cout << "Req Smem: " << config.dynamicSmemBytes / 1024.f
-                      << " Kbytes" << std::endl;
-            if (cluster_size < hypo_cluster_size) {
-                std::cout << "cluster size error" << cluster_size << std::endl;
-            }
+                std::cout << "Iteration " << iter << ": grid_size=" << grid_size
+                          << ", ROWS_PER_CTA=" << ROWS_PER_CTA
+                          << ", smem=" << smem_bytes / 1024.0 << " KB"
+                          << ", numBlocksPerSM=" << numBlocksPerSM << std::endl;
 #endif
+            }
+
+            ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(num_tokens, grid_size);
+            smem_bytes = compute_sm_for_rows(ROWS_PER_CTA);
+
+            cudaFuncSetAttribute(kernel_wrapper,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem_bytes);
+
+#if KERNEL_DEBUG
+            std::cout << "=== Final Launch Config ===" << std::endl;
+            std::cout << "  num_tokens: " << num_tokens << std::endl;
+            std::cout << "  grid_size: " << grid_size << std::endl;
+            std::cout << "  ROWS_PER_CTA: " << ROWS_PER_CTA << std::endl;
+            std::cout << "  smem_bytes: " << smem_bytes / 1024.0 << " KB"
+                      << std::endl;
+            std::cout << "  padding_indices: " << padding_indices << std::endl;
+            std::cout << "  padding_weights: " << padding_weights << std::endl;
+#endif
+
+            // ========== Launch Kernel ==========
             auto grid_dim = dim3(grid_size, 1, 1);
-            // recompute config
-            // if (cluster_size > hypo_cluster_size) {
-            //     ROWS_PER_CTA = (num_tokens + cluster_size - 1) /
-            //     cluster_size; local_offset_size =
-            //         FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) *
-            //         warp_size * topk;
-
-            //     config.dynamicSmemBytes = compute_sm();
-            //     cuda_error = cudaFuncSetAttribute(
-            //         kernel_wrapper,
-            //         cudaFuncAttributeMaxDynamicSharedMemorySize,
-            //         config.dynamicSmemBytes);
-            //     TORCH_CHECK(cuda_error == 0, cudaGetErrorString(cuda_error))
-            //     grid_dim = dim3(cluster_size, 1, 1);
-            // }
-
-#if KERNEL_DEBUG
-            std::cout << "fixed sm size: " << fixed_sm_size << ","
-                      << "padding weights: " << padding_before_weights
-                      << std::endl;
-#endif
             auto block_dim = dim3(THREAD_PER_CTA, 1, 1);
-
-            // cudaLaunchAttribute attribute[1];
-            // attribute[0].id = cudaLaunchAttributeClusterDimension;
-            // attribute[0].val.clusterDim.x =
-            //     grid_dim.x;  // Cluster size in X-dimension
-            // attribute[0].val.clusterDim.y = 1;
-            // attribute[0].val.clusterDim.z = 1;
-            // config.attrs = attribute;
-            // config.numAttrs = 1;
             const cudaStream_t current_stream =
                 at::cuda::getCurrentCUDAStream();
-            // config.stream = current_stream;
 
             auto router_logits_ptr =
                 reinterpret_cast<const InValType*>(gating_output.data_ptr());
-            // auto topk_weights_ptr =
-            //     reinterpret_cast<InValType*>(topk_weights.data_ptr());
             auto gate_scale_ptr =
                 reinterpret_cast<OutValType*>(gate_scale.data_ptr());
-            // auto topk_indices_ptr = topk_indices.data_ptr<IdxType>();
             auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
@@ -1405,14 +1349,14 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            // TODO: we need to change this to grid group, and allocate an extra
-            // space for prior_contrib
+            // Allocate temporary buffers for grid sync
             int32_t* prior_contrib;
             int32_t* hist_prefix;
-            cudaMalloc(&prior_contrib,
-                       grid_dim.x * num_experts * sizeof(int32_t));
-            cudaMalloc(&hist_prefix,
-                       grid_dim.x * num_experts * sizeof(int32_t));
+            cudaMallocAsync(&prior_contrib,
+                       grid_dim.x * num_experts * sizeof(int32_t), current_stream);
+            cudaMallocAsync(&hist_prefix,
+                       grid_dim.x * num_experts * sizeof(int32_t), current_stream);
+
             void* args[] = {
                 (void*)&router_logits_ptr,  (void*)&max_n_tiles,
                 (void*)&num_tokens,         (void*)&gate_scale_ptr,
@@ -1421,12 +1365,17 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                 (void*)&expt_offs_ptr,      (void*)&hist_ptr,
                 (void*)&prior_contrib,      (void*)&hist_prefix,
                 (void*)&padding_indices,    (void*)&padding_weights};
-            cudaLaunchCooperativeKernel(
-                (void*)kernel_wrapper, grid_dim, block_dim, args,
-                compute_sm_for_rows(ROWS_PER_CTA), current_stream);
-            cudaStreamSynchronize(current_stream);
-            cudaFree(prior_contrib);
-            cudaFree(hist_prefix);
+
+             cudaLaunchCooperativeKernel(
+                (void*)kernel_wrapper, grid_dim, block_dim, args, smem_bytes,
+                current_stream);
+            // TORCH_CHECK(cuda_error == cudaSuccess,
+            //             "cudaLaunchCooperativeKernel failed: ",
+            //             cudaGetErrorString(cuda_error));
+
+            // cudaStreamSynchronize(current_stream);
+            cudaFreeAsync(prior_contrib, current_stream);
+            cudaFreeAsync(hist_prefix, current_stream);
             break;
         }
         case 128: {
