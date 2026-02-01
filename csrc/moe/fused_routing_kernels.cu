@@ -188,24 +188,41 @@ __forceinline__ __device__ void _prefix_hist_CTA(
     // per expert) Step 1: Each CTA writes its local hist to prefix buffer
     int tid = threadIdx.x;
     int CTA_ID = blockIdx.x;
-    if (tid < NUM_EXPERTS && CTA_ID < handle.num_blocks() - 1)
-        prefix[(CTA_ID + 1) * NUM_EXPERTS + tid] = hist[tid];
+    int num_steps = NUM_EXPERTS / 4;
+    if (CTA_ID < handle.num_blocks() - 1 && tid < num_steps)
+        *reinterpret_cast<int4*>(prefix + (CTA_ID + 1) * NUM_EXPERTS +
+                                 tid * 4) =
+            *reinterpret_cast<int4*>(hist + tid * 4);
 
     handle.sync();
 
     // Step 2: CTA 0 performs sequential exclusive prefix sum
     if (CTA_ID == 0) {
         // First block has no prior contribution
-        if (tid < NUM_EXPERTS) {
-            prefix[tid] = 0;
-        }
+        if (tid < num_steps) *reinterpret_cast<int4*>(prefix + tid * 4) = make_int4(0,0,0,0);
+        // if (tid < NUM_EXPERTS) {
+        //     prefix[tid] = 0;
+        // }
 
         // First, compute exclusive prefix sum in-place
         for (int bdx = 1; bdx < handle.num_blocks(); bdx++) {
-            if (tid < NUM_EXPERTS) {
-                prefix[bdx * NUM_EXPERTS + tid] +=
-                    prefix[(bdx - 1) * NUM_EXPERTS + tid];
+            if (tid < num_steps) {
+                int4* current_ptr = reinterpret_cast<int4*>(
+                    prefix + bdx * NUM_EXPERTS + tid * 4);
+                int4* prev_ptr = reinterpret_cast<int4*>(
+                    prefix + (bdx - 1) * NUM_EXPERTS + tid * 4);
+                int4 current_val = *current_ptr;
+                int4 prev_val = *prev_ptr;
+                current_val.x += prev_val.x;
+                current_val.y += prev_val.y;
+                current_val.z += prev_val.z;
+                current_val.w += prev_val.w;
+                *current_ptr = current_val;
             }
+            // if (tid < NUM_EXPERTS) {
+            //     prefix[bdx * NUM_EXPERTS + tid] +=
+            //         prefix[(bdx - 1) * NUM_EXPERTS + tid];
+            // }
             __syncthreads();
         }
     }
