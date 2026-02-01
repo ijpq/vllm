@@ -922,7 +922,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     __shared__
         typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ __align__(16) int32_t sm_hist[];
-    int topk_indices_sm_size = topk_padded * ROWS_PER_CTA;
+    int topk_indices_sm_size =
+        FUSED_ROUTING_CEIL_DIV(ROWS_PER_CTA, warp_size) * warp_size *
+        topk_padded;
     int topk_weights_sm_size =
         topk_padded * ROWS_PER_CTA * sizeof(InValDtype) / sizeof(int32_t);
     int global_hist_offset = 0;
@@ -1003,7 +1005,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 // (TODO)2 way bank conflict
                 topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices_ptr[local_i * topk + k] = topk_indices_local[k];
+                topk_indices_ptr[layout_addr(local_i, k)] = topk_indices_local[k];
             }
 
             // Note: Shared memory writes for indices_ptr removed since
@@ -1146,7 +1148,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         int local_i = i - row;
 
         for (int k = 0; k < topk; k++) {
-            int expert_id = topk_indices_ptr[local_i * topk + k];
+            int expert_id = topk_indices_ptr[layout_addr(local_i, k)];
             if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
                 InValDtype val = topk_weights_ptr[local_i * topk + k];
                 int flat_idx = i * topk + k;
@@ -1227,7 +1229,9 @@ void routing_kernel_helper(torch::Tensor& gating_output, int64_t max_n_tiles,
                 size_t topk_weights_size = rows_per_cta * const_topk_padded;
                 size_t topk_weights_size_int =
                     topk_weights_size * sizeof(InValType) / sizeof(int32_t);
-                size_t topk_indices_size = rows_per_cta * const_topk_padded;
+                size_t topk_indices_size =
+                    FUSED_ROUTING_CEIL_DIV(rows_per_cta, warp_size) *
+                    warp_size * const_topk_padded;
                 size_t topk_indices_size_int = topk_indices_size;
 
                 fixed_sm_size = global_hist_size + local_hist_size +
