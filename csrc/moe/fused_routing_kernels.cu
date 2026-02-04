@@ -93,7 +93,20 @@ __device__ int layout_addr(int row, int col) {
     int addr = warp_offset + group_offset + elem_idx;
     return addr;
 }
-
+template<int bytes>
+__device__ __forceinline__ void cp_async_ca_pred_N(void* smem_ptr,
+                                                 const void* glob_ptr,
+                                                 bool pred = true) {
+    volatile uint32_t smem =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "{\n"
+        "   .reg .pred p;\n"
+        "   setp.ne.b32 p, %0, 0;\n"
+        "   @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+        "}\n" ::"r"((int)pred), 
+        "r"(smem), "l"(glob_ptr), "n"(bytes));
+}
 __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
                                                  const void* glob_ptr,
                                                  bool pred = true) {
@@ -183,14 +196,14 @@ __forceinline__ __device__ void collect_hist(
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void _prefix_hist_CTA(
     typename cooperative_groups::grid_group& handle, int32_t* __restrict__ hist,
-    int32_t* __restrict__ prefix) {
+    int32_t* __restrict__ global_prefix, int32_t* __restrict__ prefix_sm) {
     // prefix[i, :] = sum_{j=0}^{i-1}{local_hist[j, :]} (exclusive prefix sum
     // per expert) Step 1: Each CTA writes its local hist to prefix buffer
     int tid = threadIdx.x;
     int CTA_ID = blockIdx.x;
     int num_steps = NUM_EXPERTS / 4;
     if (CTA_ID < handle.num_blocks() - 1 && tid < num_steps)
-        *reinterpret_cast<int4*>(prefix + (CTA_ID + 1) * NUM_EXPERTS +
+        *reinterpret_cast<int4*>(global_prefix + (CTA_ID + 1) * NUM_EXPERTS +
                                  tid * 4) =
             *reinterpret_cast<int4*>(hist + tid * 4);
 
@@ -199,18 +212,15 @@ __forceinline__ __device__ void _prefix_hist_CTA(
     // Step 2: CTA 0 performs sequential exclusive prefix sum
     if (CTA_ID == 0) {
         // First block has no prior contribution
-        if (tid < num_steps) *reinterpret_cast<int4*>(prefix + tid * 4) = make_int4(0,0,0,0);
-        // if (tid < NUM_EXPERTS) {
-        //     prefix[tid] = 0;
-        // }
+        if (tid < num_steps) *reinterpret_cast<int4*>(global_prefix + tid * 4) = make_int4(0,0,0,0);
 
         // First, compute exclusive prefix sum in-place
         for (int bdx = 1; bdx < handle.num_blocks(); bdx++) {
             if (tid < num_steps) {
                 int4* current_ptr = reinterpret_cast<int4*>(
-                    prefix + bdx * NUM_EXPERTS + tid * 4);
+                    global_prefix + bdx * NUM_EXPERTS + tid * 4);
                 int4* prev_ptr = reinterpret_cast<int4*>(
-                    prefix + (bdx - 1) * NUM_EXPERTS + tid * 4);
+                    global_prefix + (bdx - 1) * NUM_EXPERTS + tid * 4);
                 int4 current_val = *current_ptr;
                 int4 prev_val = *prev_ptr;
                 current_val.x += prev_val.x;
@@ -219,11 +229,6 @@ __forceinline__ __device__ void _prefix_hist_CTA(
                 current_val.w += prev_val.w;
                 *current_ptr = current_val;
             }
-            // if (tid < NUM_EXPERTS) {
-            //     prefix[bdx * NUM_EXPERTS + tid] +=
-            //         prefix[(bdx - 1) * NUM_EXPERTS + tid];
-            // }
-            __syncthreads();
         }
     }
 }
@@ -1055,8 +1060,14 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
     // _prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
     //                              sm_hist + expert_across_offset);
+    int32_t* prior_contrib_sm =
+        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
     _prefix_hist_CTA<NUM_EXPERTS>(grid, sm_hist + local_hist_offset,
-                                  prior_contrib);
+                                  prior_contrib, prior_contrib_sm);
+    grid.sync();
+    if (local_tid < NUM_EXPERTS)
+        cp_async_ca_pred_N<4>(prior_contrib_sm + local_tid, prior_contrib + CTA_ID * NUM_EXPERTS + local_tid, local_tid < NUM_EXPERTS);
+    cp_async_fence();
     // cluster.sync();
     grid.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
@@ -1134,11 +1145,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
     /*=============================================phase 3*/
 
-    int32_t* prior_contrib_sm =
-        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
-    if (local_tid < NUM_EXPERTS)
-        prior_contrib_sm[local_tid] =
-            prior_contrib[CTA_ID * NUM_EXPERTS + local_tid];
+    cp_async_wait<0>();
+    // if (local_tid < NUM_EXPERTS)
+    //     prior_contrib_sm[local_tid] =
+    //         prior_contrib[CTA_ID * NUM_EXPERTS + local_tid];
 
     /*
     WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
