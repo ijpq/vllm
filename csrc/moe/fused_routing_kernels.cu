@@ -216,19 +216,23 @@ __forceinline__ __device__ void _prefix_hist_CTA(
 
         // First, compute exclusive prefix sum in-place
         for (int bdx = 1; bdx < handle.num_blocks(); bdx++) {
-            if (tid < num_steps) {
-                int4* current_ptr = reinterpret_cast<int4*>(
-                    global_prefix + bdx * NUM_EXPERTS + tid * 4);
-                int4* prev_ptr = reinterpret_cast<int4*>(
-                    global_prefix + (bdx - 1) * NUM_EXPERTS + tid * 4);
-                int4 current_val = *current_ptr;
-                int4 prev_val = *prev_ptr;
-                current_val.x += prev_val.x;
-                current_val.y += prev_val.y;
-                current_val.z += prev_val.z;
-                current_val.w += prev_val.w;
-                *current_ptr = current_val;
+            if (tid < NUM_EXPERTS) {
+                global_prefix[bdx * NUM_EXPERTS + tid] += global_prefix[(bdx - 1) * NUM_EXPERTS + tid];
             }
+            
+            // if (tid < num_steps) {
+            //     int4* current_ptr = reinterpret_cast<int4*>(
+            //         global_prefix + bdx * NUM_EXPERTS + tid * 4);
+            //     int4* prev_ptr = reinterpret_cast<int4*>(
+            //         global_prefix + (bdx - 1) * NUM_EXPERTS + tid * 4);
+            //     int4 current_val = *current_ptr;
+            //     int4 prev_val = *prev_ptr;
+            //     current_val.x += prev_val.x;
+            //     current_val.y += prev_val.y;
+            //     current_val.z += prev_val.z;
+            //     current_val.w += prev_val.w;
+            //     *current_ptr = current_val;
+            // }
         }
     }
 }
@@ -985,9 +989,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
          i += blockDim.x) {
         sm_hist[block_pid_offset + i] = -1;
     }
-    // cluster.sync();  // we need to ensure global hist in CTA0 had been
-    // memset.
-    grid.sync();
 
     /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
     int32_t* local_hist =
@@ -1046,10 +1047,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                     atomicAdd(local_hist + expert_id, 1);
             }
         }
-        __syncthreads();  // Sync before next iteration
+        // __syncthreads();  // Sync before next iteration
     }
     // cluster.sync();
-    grid.sync();
+    // grid.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
     _collect_hist<NUM_EXPERTS>(grid, local_hist, hist_ptr, global_hist);
@@ -1064,12 +1065,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
     _prefix_hist_CTA<NUM_EXPERTS>(grid, sm_hist + local_hist_offset,
                                   prior_contrib, prior_contrib_sm);
-    grid.sync();
+    grid.sync(); // ensure CTA0 finish global mem write
     if (local_tid < NUM_EXPERTS)
         cp_async_ca_pred_N<4>(prior_contrib_sm + local_tid, prior_contrib + CTA_ID * NUM_EXPERTS + local_tid, local_tid < NUM_EXPERTS);
     cp_async_fence();
-    // cluster.sync();
-    grid.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
         int32_t* global_hist_sm0 =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
