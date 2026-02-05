@@ -50,9 +50,9 @@ __device__ void debug_cp_async_int32(const int32_t* sm_base,
 }
 #endif
 
-#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y)-1) / (y))
+#define FUSED_ROUTING_CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 
-#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y)-1) / (y) * (y)) - (x))
+#define MAKE_ALIGNMENT_DIFF(x, y) ((((x) + (y) - 1) / (y) * (y)) - (x))
 
 __device__ int layout_addr(int row, int col) {
     /*
@@ -93,10 +93,10 @@ __device__ int layout_addr(int row, int col) {
     int addr = warp_offset + group_offset + elem_idx;
     return addr;
 }
-template<int bytes>
+template <int bytes>
 __device__ __forceinline__ void cp_async_ca_pred_N(void* smem_ptr,
-                                                 const void* glob_ptr,
-                                                 bool pred = true) {
+                                                   const void* glob_ptr,
+                                                   bool pred = true) {
     volatile uint32_t smem =
         static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
@@ -104,7 +104,7 @@ __device__ __forceinline__ void cp_async_ca_pred_N(void* smem_ptr,
         "   .reg .pred p;\n"
         "   setp.ne.b32 p, %0, 0;\n"
         "   @p cp.async.ca.shared.global [%1], [%2], %3;\n"
-        "}\n" ::"r"((int)pred), 
+        "}\n" ::"r"((int)pred),
         "r"(smem), "l"(glob_ptr), "n"(bytes));
 }
 __device__ __forceinline__ void cp_async_cg_pred(void* smem_ptr,
@@ -212,14 +212,17 @@ __forceinline__ __device__ void _prefix_hist_CTA(
     // Step 2: CTA 0 performs sequential exclusive prefix sum
     if (CTA_ID == 0) {
         // First block has no prior contribution
-        if (tid < num_steps) *reinterpret_cast<int4*>(global_prefix + tid * 4) = make_int4(0,0,0,0);
+        if (tid < num_steps)
+            *reinterpret_cast<int4*>(global_prefix + tid * 4) =
+                make_int4(0, 0, 0, 0);
 
         // First, compute exclusive prefix sum in-place
         for (int bdx = 1; bdx < handle.num_blocks(); bdx++) {
             if (tid < NUM_EXPERTS) {
-                global_prefix[bdx * NUM_EXPERTS + tid] += global_prefix[(bdx - 1) * NUM_EXPERTS + tid];
+                global_prefix[bdx * NUM_EXPERTS + tid] +=
+                    global_prefix[(bdx - 1) * NUM_EXPERTS + tid];
             }
-            
+
             // if (tid < num_steps) {
             //     int4* current_ptr = reinterpret_cast<int4*>(
             //         global_prefix + bdx * NUM_EXPERTS + tid * 4);
@@ -1065,62 +1068,66 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
     _prefix_hist_CTA<NUM_EXPERTS>(grid, sm_hist + local_hist_offset,
                                   prior_contrib, prior_contrib_sm);
-    grid.sync(); // ensure CTA0 finish global mem write
+    grid.sync();  // ensure CTA0 finish global mem write
     if (local_tid < NUM_EXPERTS)
-        cp_async_ca_pred_N<4>(prior_contrib_sm + local_tid, prior_contrib + CTA_ID * NUM_EXPERTS + local_tid, local_tid < NUM_EXPERTS);
+        cp_async_ca_pred_N<4>(prior_contrib_sm + local_tid,
+                              prior_contrib + CTA_ID * NUM_EXPERTS + local_tid,
+                              local_tid < NUM_EXPERTS);
     cp_async_fence();
-    if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
-        int32_t* global_hist_sm0 =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-        int lane_id = threadIdx.x % 32;
-        int h = global_hist_sm0[lane_id];
-        // compute global hist prefixsum
-        if (warp_id == 0) {
-            int exclusive_res = 0;
-            int warp_reduce = 0;
-            WarpScan(temp_storage_hist[0])
-                .ExclusiveSum(h, exclusive_res, warp_reduce);
-            int32_t* hist_sum = reinterpret_cast<int32_t*>(
-                sm_hist + global_hist_exclusivesum_offset);
-            hist_sum[local_tid] = exclusive_res;
-            if (local_tid == 0) hist_sum[NUM_EXPERTS] = warp_reduce;
-        }
-
-        // align the data with triton's matmul_ogs
-        int BLOCK_M_LOG2_START = 4;
-        int block_m_log2 = BLOCK_M_LOG2_START + warp_id;
-        int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
-        int32_t* pid_map_row =
-            reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
-            warp_id * MAX_N_TILES;
-        int n_tiles = (h + block_m - 1) / block_m;
-        int warp_reduce = 0;
-        int exclusive_res = 0;
-        WarpScan(temp_storage_tiles[warp_id])
-            .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
-
-        int32_t* token_offs_pad =
-            reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
-        token_offs_pad[warp_id * (NUM_EXPERTS + 1) + lane_id] = exclusive_res;
-        if (lane_id == 0)
-            token_offs_pad[warp_id * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
-                warp_reduce;
-
-        int tile_start = exclusive_res;
-        for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
-            int packed_val = (block_idx << 16) | lane_id;
-            pid_map_row[(tile_start + block_idx)] = packed_val;
-        }
-    }
-    // topk_weights already written to global memory in Phase 0+1
-    // cluster.sync();
-    grid.sync();
-
-    // WB global memory
-    int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
-    int pid_map_size = NUM_BLOCK_SIZES * (MAX_N_TILES);
-
     if (CTA_ID == 0) {
+        if (warp_id < NUM_BLOCK_SIZES) {
+            int32_t* global_hist_sm0 =
+                reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+            int lane_id = threadIdx.x % 32;
+            int h = global_hist_sm0[lane_id];
+            // compute global hist prefixsum
+            if (warp_id == 0) {
+                int exclusive_res = 0;
+                int warp_reduce = 0;
+                WarpScan(temp_storage_hist[0])
+                    .ExclusiveSum(h, exclusive_res, warp_reduce);
+                int32_t* hist_sum = reinterpret_cast<int32_t*>(
+                    sm_hist + global_hist_exclusivesum_offset);
+                hist_sum[local_tid] = exclusive_res;
+                if (local_tid == 0) hist_sum[NUM_EXPERTS] = warp_reduce;
+            }
+
+            // align the data with triton's matmul_ogs
+            int BLOCK_M_LOG2_START = 4;
+            int block_m_log2 = BLOCK_M_LOG2_START + warp_id;
+            int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
+            int32_t* pid_map_row =
+                reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
+                warp_id * MAX_N_TILES;
+            int n_tiles = (h + block_m - 1) / block_m;
+            int warp_reduce = 0;
+            int exclusive_res = 0;
+            WarpScan(temp_storage_tiles[warp_id])
+                .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
+
+            int32_t* token_offs_pad =
+                reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
+            token_offs_pad[warp_id * (NUM_EXPERTS + 1) + lane_id] =
+                exclusive_res;
+            if (lane_id == 0)
+                token_offs_pad[warp_id * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
+                    warp_reduce;
+
+            int tile_start = exclusive_res;
+            for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
+                int packed_val = (block_idx << 16) | lane_id;
+                pid_map_row[(tile_start + block_idx)] = packed_val;
+            }
+        }
+        // topk_weights already written to global memory in Phase 0+1
+        // cluster.sync();
+        // grid.sync();
+        __syncthreads();
+
+        // WB global memory
+        int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
+        int pid_map_size = NUM_BLOCK_SIZES * (MAX_N_TILES);
+
         int32_t* token_offs_pad =
             reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
         int32_t* block_pid =
@@ -1129,18 +1136,19 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             token_offs_pad_ptr[i] = token_offs_pad[i];
         for (int i = local_tid; i < pid_map_size; i += blockDim.x)
             block_pid_map_ptr[i] = block_pid[i];
+
+        if (local_tid < NUM_EXPERTS) {
+            int32_t* hist_sum = reinterpret_cast<int32_t*>(
+                sm_hist + global_hist_exclusivesum_offset);
+            int32_t* global_hist_sm =
+                reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+            expt_offs_ptr[local_tid] = hist_sum[local_tid];
+            // hist_ptr[local_tid] = global_hist_sm[local_tid];
+            if (local_tid == 0)
+                expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
+        }
     }
-    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
-        int32_t* hist_sum = reinterpret_cast<int32_t*>(
-            sm_hist + global_hist_exclusivesum_offset);
-        int32_t* global_hist_sm =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-        expt_offs_ptr[local_tid] = hist_sum[local_tid];
-        // hist_ptr[local_tid] = global_hist_sm[local_tid];
-        if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
-    }
-    // cluster.sync();
-    grid.sync();
+    grid.sync();  // end of phase2
 
     /*=============================================phase 3*/
 
@@ -1149,19 +1157,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     //     prior_contrib_sm[local_tid] =
     //         prior_contrib[CTA_ID * NUM_EXPERTS + local_tid];
 
-    /*
-    WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
-    cudaErrorLaunchFailure.
-    */
-    // int32_t* hist_sum_sm0 = cluster.map_shared_rank(
-    //     reinterpret_cast<int32_t*>(sm_hist +
-    //     global_hist_exclusivesum_offset), 0);
-    // int32_t* hist_sum_local =
-    //     reinterpret_cast<int32_t*>(sm_hist +
-    //     global_hist_exclusivesum_offset);
-    // if (local_tid < NUM_EXPERTS)
-    //     hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
-    // cluster.sync();
+    // make global_hist prefix in CTA0 sync to all CTAs through GMEM
     int32_t* hist_sum =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
     if (CTA_ID == 0 && local_tid <= NUM_EXPERTS)
@@ -1169,11 +1165,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     grid.sync();
     if (local_tid <= NUM_EXPERTS) hist_sum[local_tid] = hist_prefix[local_tid];
 
-    grid.sync();
+    grid.sync();  // can we remove this ?
 
-    // Phase 3: Write gate_scale, topk_index, gate_index using the computed topk
-    // results Read directly from global memory since Phase 0+1 already wrote
-    // topk_weights and topk_indices there
+    // Phase 3: Write gate_scale, topk_index, gate_index using the computed
+    // topk results Read directly from global memory since Phase 0+1 already
+    // wrote topk_weights and topk_indices there
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
@@ -1189,7 +1185,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
                 int global_pos = expert_base + expert_prior + expert_local;
 
-                __stcs(gate_scale + global_pos, static_cast<OutValDtype>(val)); 
+                __stcs(gate_scale + global_pos, static_cast<OutValDtype>(val));
                 __stcs(topk_index + global_pos, flat_idx);
                 __stcs(gate_index + flat_idx, global_pos);
                 // gate_scale[global_pos] = static_cast<OutValDtype>(val);
