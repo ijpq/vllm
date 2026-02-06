@@ -1074,6 +1074,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                               prior_contrib + CTA_ID * NUM_EXPERTS + local_tid,
                               local_tid < NUM_EXPERTS);
     cp_async_fence();
+    int32_t* hist_sum = reinterpret_cast<int32_t*>(
+        sm_hist + global_hist_exclusivesum_offset);
     if (CTA_ID == 0) {
         if (warp_id < NUM_BLOCK_SIZES) {
             int32_t* global_hist_sm0 =
@@ -1086,10 +1088,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 int warp_reduce = 0;
                 WarpScan(temp_storage_hist[0])
                     .ExclusiveSum(h, exclusive_res, warp_reduce);
-                int32_t* hist_sum = reinterpret_cast<int32_t*>(
-                    sm_hist + global_hist_exclusivesum_offset);
                 hist_sum[local_tid] = exclusive_res;
-                if (local_tid == 0) hist_sum[NUM_EXPERTS] = warp_reduce;
+                hist_prefix[local_tid] = exclusive_res;
+                if (local_tid == 0) {
+                    hist_sum[NUM_EXPERTS] = warp_reduce;
+                    hist_prefix[NUM_EXPERTS] = warp_reduce;}
             }
 
             // align the data with triton's matmul_ogs
@@ -1148,28 +1151,19 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
         }
     }
+    
     grid.sync();  // end of phase2
 
     /*=============================================phase 3*/
 
-    cp_async_wait<0>();
-    // if (local_tid < NUM_EXPERTS)
-    //     prior_contrib_sm[local_tid] =
-    //         prior_contrib[CTA_ID * NUM_EXPERTS + local_tid];
-
-    // make global_hist prefix in CTA0 sync to all CTAs through GMEM
-    int32_t* hist_sum =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
-    if (CTA_ID == 0 && local_tid <= NUM_EXPERTS)
-        hist_prefix[local_tid] = hist_sum[local_tid];
-    grid.sync();
     if (local_tid <= NUM_EXPERTS) hist_sum[local_tid] = hist_prefix[local_tid];
+    __syncthreads(); // ensure hist_sm
 
-    grid.sync();  // can we remove this ?
 
     // Phase 3: Write gate_scale, topk_index, gate_index using the computed
     // topk results Read directly from global memory since Phase 0+1 already
     // wrote topk_weights and topk_indices there
+    cp_async_wait<0>(); // ensure prior_contrib_sm
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
@@ -1185,12 +1179,12 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
                 int global_pos = expert_base + expert_prior + expert_local;
 
-                __stcs(gate_scale + global_pos, static_cast<OutValDtype>(val));
-                __stcs(topk_index + global_pos, flat_idx);
-                __stcs(gate_index + flat_idx, global_pos);
-                // gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                // topk_index[global_pos] = flat_idx;
-                // gate_index[flat_idx] = global_pos;
+                // __stcs(gate_scale + global_pos, static_cast<OutValDtype>(val));
+                // __stcs(topk_index + global_pos, flat_idx);
+                // __stcs(gate_index + flat_idx, global_pos);
+                gate_scale[global_pos] = static_cast<OutValDtype>(val);
+                topk_index[global_pos] = flat_idx;
+                gate_index[flat_idx] = global_pos;
             }
         }
     }
