@@ -902,7 +902,6 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16,
         }
     }
 }
-
 template <>
 __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     const __nv_bfloat16* __restrict__ router_logits,  // [NUM_TOKENS, 32]
@@ -921,7 +920,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     auto MAX_N_TILES = max_n_tiles;
     auto PADDING_INDICES = padding_indices;
     auto PADDING_WEIGHTS = padding_weights;
-    // cg::cluster_group cluster = cg::this_cluster();
     cg::grid_group grid = cg::this_grid();
 
     int local_tid = threadIdx.x;
@@ -939,17 +937,9 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     static constexpr int warp_size = 32;
     static constexpr int num_stages = 2;
 
-    // shared memory layout
-    /*
-    Assumingly, shared Mem is organized as this layout:
-    [NUM_EXPERTS] : global hist !only 0
-    [NUM_EXPERTS] : local histgram for each threadblock
-    [NUM_EXPERTS+1]: global hist exclusive-sum !only 0
-    [NUM_BLOCK_SIZES, NUM_EXPERTS+1] : token_offs_pad
-    [NUM_BLOCK_SIZES, max_n_tiles] : block_pid
-    [NUM_EXPERTS]: exclusivesum for experts
-    [ROWS_PER_CTA*topkpadded]: local_offset
-    */
+    // =========================================================================
+    // shared memory layout (保留原布局，后续再调整 size)
+    // =========================================================================
     using WarpScan = cub::WarpScan<int>;
     __shared__ typename WarpScan::TempStorage
         temp_storage_hist[NUM_EXPERTS / warp_size];
@@ -977,9 +967,16 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int topk_weights_offset =
         topk_indices_offset + topk_indices_sm_size + PADDING_WEIGHTS;
     int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
+
+    // 复用原有 shared memory 区域:
+    //   local_offset_sm  → 存 global atomicAdd 返回的 expert 内偏移
+    //   topk_indices_ptr → 存 topk expert ids
+    //   topk_weights_ptr → 存 topk weights (bf16)
+    int32_t* local_offset_sm =
+        reinterpret_cast<int32_t*>(sm_hist + local_offset_offset);
+    int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
     __nv_bfloat16* topk_weights_ptr =
         reinterpret_cast<__nv_bfloat16*>(sm_hist + topk_weights_offset);
-    int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
 
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
@@ -993,112 +990,91 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         sm_hist[block_pid_offset + i] = -1;
     }
 
-    /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
-    int32_t* local_hist =
-        reinterpret_cast<int32_t*>(sm_hist + local_hist_offset);
-    int32_t* local_offset_sm =
-        reinterpret_cast<int32_t*>(sm_hist + local_offset_offset);
+    // =========================================================================
+    // Phase 1: topk + softmax + global atomicAdd (仅计数)
+    //          保存 expert 内偏移 + topk 结果到 shared memory
+    // =========================================================================
     int row = CTA_ID * ROWS_PER_CTA;
-    int row_end = min((int64_t)(row + ROWS_PER_CTA),
-                      NUM_TOKENS);  // Each CTA only processes its own rows
+    int row_end = min((int64_t)(row + ROWS_PER_CTA), NUM_TOKENS);
 
-    // Note: indices_ptr removed since Phase 3 reads directly from global
-    // memory.
-
-    // For 32 experts, use 1 thread per row (each thread handles all 32 experts)
-    // 512 threads = 512 rows per iteration
     constexpr int THREADS_PER_ROW_TOPK = 1;
-    constexpr int ROWS_PER_ITER = THREAD_PER_CTA / THREADS_PER_ROW_TOPK;  // 512
+    constexpr int ROWS_PER_ITER = THREAD_PER_CTA / THREADS_PER_ROW_TOPK;
 
     int lane_id = threadIdx.x % warp_size;
     int warp_id_local = threadIdx.x / warp_size;
-    int thread_group_idx = 0;  // For 32 experts, each thread works alone
+    int thread_group_idx = 0;
     int row_in_iter = threadIdx.x;
+
 #pragma unroll 1
     for (int iter_base = row; iter_base < row_end; iter_base += ROWS_PER_ITER) {
         int current_row = iter_base + row_in_iter;
         int local_i = current_row - row;
 
-        // Temporary storage for topk results
         float topk_weights_f[topk];
         int32_t topk_indices_local[topk];
 
         if (current_row < row_end) {
-            // Compute topk+softmax for this row (each thread handles one row
-            // independently)
             compute_topk_softmax_row<NUM_EXPERTS, THREADS_PER_ROW_TOPK>(
                 router_logits + current_row * NUM_EXPERTS, topk_weights_f,
                 topk_indices_local, thread_group_idx, lane_id, warp_id_local);
 
 #pragma unroll
             for (int k = 0; k < topk; k++) {
-                // (TODO)2 way bank conflict
+                int expert_id = topk_indices_local[k];
+
+                // global atomicAdd: 返回值是 expert 内部偏移 (0, 1, 2, ...)
+                // hist_ptr[expert_id] 最终累积到 hist[expert_id]
+                int expert_local_offset = atomicAdd(hist_ptr + expert_id, 1);
+
+                // 保存到 shared memory，Phase 3 使用
+                local_offset_sm[local_i * topk + k] = expert_local_offset;
+                topk_indices_ptr[local_i * topk + k] = expert_id;
                 topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices_ptr[layout_addr(local_i, k)] =
-                    topk_indices_local[k];
-            }
-
-            // Note: Shared memory writes for indices_ptr removed since
-            // Phase 3 now reads directly from global memory.
-
-// Build histogram and local offsets
-#pragma unroll
-            for (int k = 0; k < topk; k++) {
-                int expert_id = topk_indices_local[k];
-                local_offset_sm[layout_addr(local_i, k)] =
-                    atomicAdd(local_hist + expert_id, 1);
             }
         }
-        // __syncthreads();  // Sync before next iteration
     }
-    // cluster.sync();
-    // grid.sync();
-    int32_t* global_hist =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    _collect_hist<NUM_EXPERTS>(grid, local_hist, hist_ptr, global_hist);
 
-    /*===========================================phase 2*/
+    // =========================================================================
+    // grid.sync() #1: 等所有 CTA 完成 atomicAdd，hist_ptr 达到最终值
+    // =========================================================================
+    grid.sync();
+
+    // =========================================================================
+    // Phase 2: prefix sum + token_offs_pad + block_pid_map (CTA 0 only)
+    // =========================================================================
     int warp_id = threadIdx.x / 32;
-    // compute expert_across_prefixsum, dst_experts[i] =
-    // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
-    // _prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
-    //                              sm_hist + expert_across_offset);
-    int32_t* prior_contrib_sm =
-        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
-    _prefix_hist_CTA<NUM_EXPERTS>(grid, sm_hist + local_hist_offset,
-                                  prior_contrib, prior_contrib_sm);
-    grid.sync();  // ensure CTA0 finish global mem write
-    if (local_tid < NUM_EXPERTS)
-        cp_async_ca_pred_N<4>(prior_contrib_sm + local_tid,
-                              prior_contrib + CTA_ID * NUM_EXPERTS + local_tid,
-                              local_tid < NUM_EXPERTS);
-    cp_async_fence();
+
     int32_t* hist_sum = reinterpret_cast<int32_t*>(
         sm_hist + global_hist_exclusivesum_offset);
+
     if (CTA_ID == 0) {
+        int32_t* global_hist_sm0 =
+            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+        if (local_tid < NUM_EXPERTS)
+            global_hist_sm0[local_tid] = hist_ptr[local_tid];
+        __syncthreads();
+
         if (warp_id < NUM_BLOCK_SIZES) {
-            int32_t* global_hist_sm0 =
-                reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
             int lane_id = threadIdx.x % 32;
             int h = global_hist_sm0[lane_id];
-            // compute global hist prefixsum
+
+            // warp 0: compute global hist prefix sum → hist_sum (expt_offs)
             if (warp_id == 0) {
                 int exclusive_res = 0;
                 int warp_reduce = 0;
                 WarpScan(temp_storage_hist[0])
                     .ExclusiveSum(h, exclusive_res, warp_reduce);
                 hist_sum[local_tid] = exclusive_res;
-                hist_prefix[local_tid] = exclusive_res;
                 if (local_tid == 0) {
                     hist_sum[NUM_EXPERTS] = warp_reduce;
-                    hist_prefix[NUM_EXPERTS] = warp_reduce;}
-            }
+                }
+            }  // end if (warp_id == 0)
 
-            // align the data with triton's matmul_ogs
+            // warp 0-3: 各自计算 BLOCK_M=16/32/64/128
             int BLOCK_M_LOG2_START = 4;
             int block_m_log2 = BLOCK_M_LOG2_START + warp_id;
-            int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
+            int block_m = 1 << block_m_log2;
             int32_t* pid_map_row =
                 reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
                 warp_id * MAX_N_TILES;
@@ -1121,13 +1097,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 int packed_val = (block_idx << 16) | lane_id;
                 pid_map_row[(tile_start + block_idx)] = packed_val;
             }
-        }
-        // topk_weights already written to global memory in Phase 0+1
-        // cluster.sync();
-        // grid.sync();
+        }  // end if (warp_id < NUM_BLOCK_SIZES)
+
         __syncthreads();
 
-        // WB global memory
+        // Write back to global memory
         int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
         int pid_map_size = NUM_BLOCK_SIZES * (MAX_N_TILES);
 
@@ -1140,55 +1114,50 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int i = local_tid; i < pid_map_size; i += blockDim.x)
             block_pid_map_ptr[i] = block_pid[i];
 
+        // 写 expt_offs 到 global memory，供所有 CTA 在 Phase 3 读取
         if (local_tid < NUM_EXPERTS) {
-            int32_t* hist_sum = reinterpret_cast<int32_t*>(
-                sm_hist + global_hist_exclusivesum_offset);
-            int32_t* global_hist_sm =
-                reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
             expt_offs_ptr[local_tid] = hist_sum[local_tid];
-            // hist_ptr[local_tid] = global_hist_sm[local_tid];
             if (local_tid == 0)
                 expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
         }
-    }
-    
-    grid.sync();  // end of phase2
+    }  // end if (CTA_ID == 0)
 
-    /*=============================================phase 3*/
+    // =========================================================================
+    // grid.sync() #2: 等 CTA 0 完成 Phase 2，expt_offs_ptr 可见
+    // =========================================================================
+    grid.sync();
 
-    if (local_tid <= NUM_EXPERTS) hist_sum[local_tid] = hist_prefix[local_tid];
-    __syncthreads(); // ensure hist_sm
+    // =========================================================================
+    // Phase 3: 用 expt_offs + 保存的 expert 内偏移写出最终数组
+    // =========================================================================
 
+    // 所有 CTA 从 global memory 加载 expt_offs 到 shared memory
+    if (local_tid <= NUM_EXPERTS)
+        hist_sum[local_tid] = expt_offs_ptr[local_tid];
+    __syncthreads();
 
-    // Phase 3: Write gate_scale, topk_index, gate_index using the computed
-    // topk results Read directly from global memory since Phase 0+1 already
-    // wrote topk_weights and topk_indices there
-    cp_async_wait<0>(); // ensure prior_contrib_sm
-#pragma unroll
+#pragma unroll 1
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
 
+#pragma unroll
         for (int k = 0; k < topk; k++) {
-            int expert_id = topk_indices_ptr[layout_addr(local_i, k)];
-            if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                InValDtype val = topk_weights_ptr[local_i * topk + k];
-                int flat_idx = i * topk + k;
-                int expert_base = hist_sum[expert_id];
-                int expert_prior = prior_contrib_sm[expert_id];
-                int expert_local = local_offset_sm[layout_addr(local_i, k)];
+            int expert_id = topk_indices_ptr[local_i * topk + k];
+            InValDtype val = topk_weights_ptr[local_i * topk + k];
+            int expert_local_offset = local_offset_sm[local_i * topk + k];
+            int flat_idx = i * topk + k;
 
-                int global_pos = expert_base + expert_prior + expert_local;
+            // 二级寻址: expt_offs[expert] + expert 内全局偏移
+            int global_pos = hist_sum[expert_id] + expert_local_offset;
 
-                // __stcs(gate_scale + global_pos, static_cast<OutValDtype>(val));
-                // __stcs(topk_index + global_pos, flat_idx);
-                // __stcs(gate_index + flat_idx, global_pos);
-                gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                topk_index[global_pos] = flat_idx;
-                gate_index[flat_idx] = global_pos;
-            }
+            gate_scale[global_pos] = static_cast<OutValDtype>(val);
+            topk_index[global_pos] = flat_idx;
+            gate_index[flat_idx] = global_pos;
         }
     }
 }
+
+
 
 }  // namespace moe
 }  // namespace vllm
