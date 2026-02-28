@@ -1048,16 +1048,16 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* hist_sum = reinterpret_cast<int32_t*>(
         sm_hist + global_hist_exclusivesum_offset);
 
-    if (CTA_ID == 0) {
-        int32_t* global_hist_sm0 =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-        if (local_tid < NUM_EXPERTS)
-            global_hist_sm0[local_tid] = hist_ptr[local_tid];
-        __syncthreads();
+    // if (CTA_ID == 0) {
+        // int32_t* global_hist_sm =
+        //     reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+        // if (local_tid < NUM_EXPERTS)
+        //     global_hist_sm[local_tid] = hist_ptr[local_tid];
+        // __syncthreads();
 
         if (warp_id < NUM_BLOCK_SIZES) {
             int lane_id = threadIdx.x % 32;
-            int h = global_hist_sm0[lane_id];
+            int h = hist_ptr[lane_id];
 
             // warp 0: compute global hist prefix sum → hist_sum (expt_offs)
             if (warp_id == 0) {
@@ -1120,21 +1120,21 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             if (local_tid == 0)
                 expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
         }
-    }  // end if (CTA_ID == 0)
+    // }  // end if (CTA_ID == 0)
 
     // =========================================================================
     // grid.sync() #2: 等 CTA 0 完成 Phase 2，expt_offs_ptr 可见
     // =========================================================================
-    grid.sync();
+    // grid.sync();
 
     // =========================================================================
     // Phase 3: 用 expt_offs + 保存的 expert 内偏移写出最终数组
     // =========================================================================
 
     // 所有 CTA 从 global memory 加载 expt_offs 到 shared memory
-    if (local_tid <= NUM_EXPERTS)
-        hist_sum[local_tid] = expt_offs_ptr[local_tid];
-    __syncthreads();
+    // if (local_tid <= NUM_EXPERTS)
+    //     hist_sum[local_tid] = expt_offs_ptr[local_tid];
+    // __syncthreads();
 
 #pragma unroll 1
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
