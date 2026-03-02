@@ -1027,7 +1027,10 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    collect_and_prefix_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
+    int32_t* prior_contrib =
+        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
+    collect_and_prefix_hist<NUM_EXPERTS>(cluster, local_hist, global_hist,  prior_contrib);
+    __syncthreads();
 
     /*===========================================phase 2*/
     int warp_id = threadIdx.x / 32;
@@ -1086,6 +1089,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
     int pid_map_size = NUM_BLOCK_SIZES * (max_n_tiles);
 
+    __syncthreads();
     if (CTA_ID == 0) {
         int32_t* token_offs_pad =
             reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
@@ -1109,8 +1113,6 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 
     /*=============================================phase 3*/
 
-    int32_t* prior_contrib =
-        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
 
     /*
     WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
@@ -1119,8 +1121,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // int32_t* hist_sum_sm0 = cluster.map_shared_rank(
     //     reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
     //     0);
-    // int32_t* hist_sum_local =
-    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
+    int32_t* hist_sum_local =
+        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
     // if (local_tid < NUM_EXPERTS)
     //     hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     // cluster.sync();
