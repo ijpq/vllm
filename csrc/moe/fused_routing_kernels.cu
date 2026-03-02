@@ -584,12 +584,12 @@ __global__ void fused_routing_kernel(
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
-    int padding_indices, int padding_weights) {
+    int padding_indices, int padding_weights, int block_m_param) {
     TORCH_CHECK(false, "unimplemented kernel");
 }
 
 template <>
-__global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
+__global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     const __nv_bfloat16* __restrict__ router_logits,  // [NUM_TOKENS, 128]
     __nv_bfloat16* __restrict__ topk_weights,         // [NUM_TOKENS, 4] output
     int32_t* __restrict__ topk_indices,               // [NUM_TOKENS, 4] output
@@ -598,7 +598,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
-    int padding_indices, int padding_weights) {
+    int padding_indices, int padding_weights, int block_m_param) {
     using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
@@ -613,7 +613,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     static constexpr int NUM_EXPERTS = 128;
     static constexpr int topk = 4;
     static constexpr int topk_padded = topk;
-    static constexpr int NUM_BLOCK_SIZES = 4;
+    static constexpr int NUM_BLOCK_SIZES = 1;
     int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
     int ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, gridDim.x);
     int HYPO_ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, 8);
@@ -775,26 +775,22 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             hist_sum[local_tid] = block_exclusive_res;
             if (local_tid == 0) hist_sum[NUM_EXPERTS] = block_reduce;
         }
-#pragma unroll
-        for (int size = 0; size < NUM_BLOCK_SIZES; size += 1) {
-            int BLOCK_M_LOG2_START = 4;
-            int block_m_log2 = BLOCK_M_LOG2_START + size;
-            int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
-            int n_tiles = FUSED_ROUTING_CEIL_DIV(h, block_m);
+        // block_m_param is passed as a kernel parameter at runtime
+        {
+            int n_tiles = FUSED_ROUTING_CEIL_DIV(h, block_m_param);
             int tiles_exclusive_res = 0;
             int tiles_reduce = 0;
-            BlockScan(temp_storage_tiles[size])
+            BlockScan(temp_storage_tiles[0])
                 .ExclusiveSum(n_tiles, tiles_exclusive_res, tiles_reduce);
             int32_t* pid_map_row =
-                reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
-                size * max_n_tiles;
+                reinterpret_cast<int32_t*>(sm_hist + block_pid_offset);
             int32_t* token_offs_pad =
                 reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
             if (local_tid < NUM_EXPERTS) {
-                token_offs_pad[size * (NUM_EXPERTS + 1) + local_tid] =
+                token_offs_pad[local_tid] =
                     tiles_exclusive_res;
                 if (local_tid == 0)
-                    token_offs_pad[size * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
+                    token_offs_pad[NUM_EXPERTS] =
                         tiles_reduce;
                 int tile_start = tiles_exclusive_res;
                 for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
@@ -883,7 +879,7 @@ __global__ void fused_routing_kernel<128, 4, 4, __nv_bfloat16, __nv_bfloat16>(
 }
 
 template <>
-__global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
+__global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     const __nv_bfloat16* __restrict__ router_logits,  // [NUM_TOKENS, 32]
     __nv_bfloat16* __restrict__ topk_weights,         // [NUM_TOKENS, 4] output
     int32_t* __restrict__ topk_indices,               // [NUM_TOKENS, 4] output
@@ -892,7 +888,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
     int32_t* __restrict__ block_pid_map_ptr,
     int32_t* __restrict__ expt_offs_ptr, int32_t* __restrict__ hist_ptr,
-    int padding_indices, int padding_weights) {
+    int padding_indices, int padding_weights, int block_m_param) {
     using namespace fused_routing;
     using InValDtype = __nv_bfloat16;
     using OutValDtype = __nv_bfloat16;
@@ -906,7 +902,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     static constexpr int NUM_EXPERTS = 32;
     static constexpr int topk = 4;
     static constexpr int topk_padded = topk;
-    static constexpr int NUM_BLOCK_SIZES = 4;
+    static constexpr int NUM_BLOCK_SIZES = 1;
     int ROWS_PER_THREADS = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, num_threads);
     int ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, gridDim.x);
     int HYPO_ROWS_PER_CTA = FUSED_ROUTING_CEIL_DIV(NUM_TOKENS, 8);
@@ -1039,13 +1035,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
     //                              sm_hist + expert_across_offset);
     // cluster.sync();
-    if (warp_id < NUM_BLOCK_SIZES) {
-        // int32_t* global_hist =
-        //     reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+    if (warp_id == 0) {
         int lane_id = threadIdx.x % 32;
         int h = global_hist[lane_id];
         // compute global hist prefixsum
-        if (warp_id == 0) {
+        {
             int exclusive_res = 0;
             int warp_reduce = 0;
             WarpScan(temp_storage_hist[0])
@@ -1057,24 +1051,20 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
 
         // align the data with triton's matmul_ogs
-        int BLOCK_M_LOG2_START = 4;
-        int block_m_log2 = BLOCK_M_LOG2_START + warp_id;
-        int block_m = 1 << block_m_log2;  // block_m = 16, 32,64,128
+        // block_m_param is passed as a kernel parameter at runtime
         int32_t* pid_map_row =
-            reinterpret_cast<int32_t*>(sm_hist + block_pid_offset) +
-            warp_id * max_n_tiles;
-        int n_tiles = (h + block_m - 1) / block_m;
+            reinterpret_cast<int32_t*>(sm_hist + block_pid_offset);
+        int n_tiles = (h + block_m_param - 1) / block_m_param;
         int warp_reduce = 0;
         int exclusive_res = 0;
-        WarpScan(temp_storage_tiles[warp_id])
+        WarpScan(temp_storage_tiles[0])
             .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
 
         int32_t* token_offs_pad =
             reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
-        token_offs_pad[warp_id * (NUM_EXPERTS + 1) + lane_id] = exclusive_res;
+        token_offs_pad[lane_id] = exclusive_res;
         if (lane_id == 0)
-            token_offs_pad[warp_id * (NUM_EXPERTS + 1) + NUM_EXPERTS] =
-                warp_reduce;
+            token_offs_pad[NUM_EXPERTS] = warp_reduce;
 
         int tile_start = exclusive_res;
         for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
@@ -1164,7 +1154,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                            torch::Tensor& topk_index, torch::Tensor& gate_index,
                            torch::Tensor& token_offs_pad,
                            torch::Tensor& block_pid_map,
-                           torch::Tensor& expt_offs, torch::Tensor& hist) {
+                           torch::Tensor& expt_offs, torch::Tensor& hist,
+                           int64_t block_m) {
     /*
     dispatch config
     */
@@ -1172,7 +1163,7 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     TORCH_CHECK(topk == 4, "");
     constexpr int const_topk = 4;
     constexpr int const_topk_padded = const_topk;  // since we've had swizzle
-    constexpr int NUM_BLOCK_SIZES = 4;
+    constexpr int NUM_BLOCK_SIZES = 1;
     const auto num_experts = gating_output.size(-1);
     const auto num_tokens = gating_output.numel() / num_experts;
 #if KERNEL_DEBUG
@@ -1342,7 +1333,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                                num_tokens, gate_scale_ptr, topk_index_ptr,
                                gate_index_ptr, token_offs_pad_ptr,
                                block_pid_map_ptr, expt_offs_ptr, hist_ptr,
-                               padding_indices, padding_weights);
+                               padding_indices, padding_weights,
+                               static_cast<int>(block_m));
             break;
         }
         case 128: {
@@ -1503,7 +1495,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
                                num_tokens, gate_scale_ptr, topk_index_ptr,
                                gate_index_ptr, token_offs_pad_ptr,
                                block_pid_map_ptr, expt_offs_ptr, hist_ptr,
-                               padding_indices, padding_weights);
+                               padding_indices, padding_weights,
+                               static_cast<int>(block_m));
             break;
         }
             TORCH_CHECK(false, "Unsupported num experts: ", num_experts);
@@ -1515,7 +1508,8 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                    int64_t topk, torch::Tensor& gate_scale,
                    torch::Tensor& topk_index, torch::Tensor& gate_index,
                    torch::Tensor& token_offs_pad, torch::Tensor& block_pid_map,
-                   torch::Tensor& expt_offs, torch::Tensor& hist) {
+                   torch::Tensor& expt_offs, torch::Tensor& hist,
+                   int64_t block_m) {
     /*
     dispatch dtype
     */
@@ -1533,7 +1527,7 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
         routing_kernel_helper<int32_t, __nv_bfloat16, __nv_bfloat16>(
             gating_output, topk_weights, topk_indices, max_n_tiles, topk,
             gate_scale, topk_index, gate_index, token_offs_pad, block_pid_map,
-            expt_offs, hist);
+            expt_offs, hist, block_m);
     } else {
         TORCH_CHECK(false, "Unsupported dtype: ", topk_indices.scalar_type(),
                     gate_scale.scalar_type());

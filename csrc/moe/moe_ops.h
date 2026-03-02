@@ -7,7 +7,8 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
                    int64_t topk, torch::Tensor& gate_scale,
                    torch::Tensor& topk_index, torch::Tensor& gate_index,
                    torch::Tensor& token_offs_pad, torch::Tensor& block_pid_map,
-                   torch::Tensor& expt_offs, torch::Tensor& hist);
+                   torch::Tensor& expt_offs, torch::Tensor& hist,
+                   int64_t block_m);
 void topk_softmax(torch::Tensor& topk_weights, torch::Tensor& topk_indices,
                   torch::Tensor& token_expert_indices,
                   torch::Tensor& gating_output, bool renormalize);

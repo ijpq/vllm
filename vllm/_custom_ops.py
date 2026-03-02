@@ -3068,7 +3068,8 @@ def fused_routing(
     token_offs_pad,
     block_pid_map,
     expt_offs,
-    hist
+    hist,
+    block_m,
 ) -> None:
     torch.ops._moe_C.fused_routing(
     gating_output,
@@ -3082,5 +3083,6 @@ def fused_routing(
     token_offs_pad,
     block_pid_map,
     expt_offs,
-    hist
+    hist,
+    block_m,
     )

@@ -81,6 +81,13 @@ def _cdiv(n, d):
     return (n + d - 1) // d
 
 
+def _next_power_of_2(x: int) -> int:
+    """Return the smallest power of 2 >= x."""
+    if x <= 0:
+        return 1
+    return 1 << (x - 1).bit_length()
+
+
 def fused_routing(
     router_logits: torch.Tensor,
     topk: int,
@@ -106,15 +113,20 @@ def fused_routing(
     topk_index = torch.empty(n_gates, device=device, dtype=torch.int32)
     gate_index = torch.empty(n_gates, device=device, dtype=torch.int32)
 
-    # block_m sizes: 16, 32, 64, 128 (NUM_BLOCK_SIZES=4)
-    BLOCK_M_LOG2_START = 4
-    NUM_BLOCK_SIZES = 4
+    # Compute the block_m that matmul_ogs will use at runtime.
+    # This matches the formula in triton_kernels opt_flags:
+    #   tokens_per_expt = max(1, M_effective // n_expts_tot)
+    #   block_m = max(16, min(next_power_of_2(tokens_per_expt), 128))
+    # where M_effective = n_gates (since gather_indx has n_gates entries).
+    tokens_per_expt = max(1, n_gates // N)
+    block_m = max(16, min(_next_power_of_2(tokens_per_expt), 128))
+
+    NUM_BLOCK_SIZES = 1
 
     if n_gates <= N:
         max_n_tiles = n_gates
     else:
-        min_block_m = 1 << BLOCK_M_LOG2_START  # 16
-        max_n_tiles = N - 1 - ((N - n_gates - 1) // min_block_m)
+        max_n_tiles = N - 1 - ((N - n_gates - 1) // block_m)
 
     token_offs_pad = torch.empty(
         (NUM_BLOCK_SIZES, N + 1), device=device, dtype=torch.int32
@@ -142,17 +154,12 @@ def fused_routing(
         token_offs_pad,
         block_pid_map,
         expt_offs,
-        hist
+        hist,
+        block_m,
     )
 
-    token_offs_pad_dict = {
-        (1 << (BLOCK_M_LOG2_START + i)): token_offs_pad[i]
-        for i in range(NUM_BLOCK_SIZES)
-    }
-    block_pid_map_dict = {
-        (1 << (BLOCK_M_LOG2_START + i)): block_pid_map[i]
-        for i in range(NUM_BLOCK_SIZES)
-    }
+    token_offs_pad_dict = {block_m: token_offs_pad[0]}
+    block_pid_map_dict = {block_m: block_pid_map[0]}
 
     expt_data = ExptData(
         hist=hist,

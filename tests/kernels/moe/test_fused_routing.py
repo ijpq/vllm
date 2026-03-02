@@ -106,8 +106,8 @@ def compare_routing_results(
     
     # 4b. Compare token_offs_pad for each block size
     try:
-        for block_m in [16, 32, 64, 128]:
-            if block_m in fused_expt_data.token_offs_pad and block_m in triton_expt_data.token_offs_pad:
+        for block_m in fused_expt_data.token_offs_pad:
+            if block_m in triton_expt_data.token_offs_pad:
                 fused_pad = fused_expt_data.token_offs_pad[block_m]
                 triton_pad = triton_expt_data.token_offs_pad[block_m]
                 
@@ -122,8 +122,8 @@ def compare_routing_results(
     
     # 4c. Compare block_pid_map for each block size
     try:
-        for block_m in [16, 32, 64, 128]:
-            if block_m in fused_expt_data.block_pid_map and block_m in triton_expt_data.block_pid_map:
+        for block_m in fused_expt_data.block_pid_map:
+            if block_m in triton_expt_data.block_pid_map:
                 fused_map = fused_expt_data.block_pid_map[block_m]
                 triton_map = triton_expt_data.block_pid_map[block_m]
                 
@@ -312,9 +312,8 @@ class TestFusedRouting:
         fused_expt_data = fused_result[0].expt_data
         triton_expt_data = triton_result[0].expt_data
         
-        for block_m in [16, 32, 64, 128]:
-            if block_m not in fused_expt_data.token_offs_pad:
-                continue
+        # fused_routing now only computes for a single block_m
+        for block_m in fused_expt_data.token_offs_pad:
             if block_m not in triton_expt_data.token_offs_pad:
                 continue
                 
