@@ -905,7 +905,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
          i += blockDim.x) {
         sm_hist[block_pid_offset + i] = -1;
     }
-    cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
+    // cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
 
     /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
     int32_t* local_hist =
