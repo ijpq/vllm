@@ -1036,11 +1036,11 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     // prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
     //                              sm_hist + expert_across_offset);
     // cluster.sync();
-    if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
-        int32_t* global_hist_sm0 =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+    if (warp_id < NUM_BLOCK_SIZES) {
+        // int32_t* global_hist =
+        //     reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         int lane_id = threadIdx.x % 32;
-        int h = global_hist_sm0[lane_id];
+        int h = global_hist[lane_id];
         // compute global hist prefixsum
         if (warp_id == 0) {
             int exclusive_res = 0;
@@ -1080,7 +1080,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         }
     }
     // topk_weights already written to global memory in Phase 0+1
-    cluster.sync();
+    // cluster.sync();
 
     // WB global memory
     int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
@@ -1105,7 +1105,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         hist_ptr[local_tid] = global_hist_sm[local_tid];
         if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
-    cluster.sync();
+    // cluster.sync();
 
     /*=============================================phase 3*/
 
@@ -1116,14 +1116,14 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
     cudaErrorLaunchFailure.
     */
-    int32_t* hist_sum_sm0 = cluster.map_shared_rank(
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
-        0);
-    int32_t* hist_sum_local =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
-    if (local_tid < NUM_EXPERTS)
-        hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
-    cluster.sync();
+    // int32_t* hist_sum_sm0 = cluster.map_shared_rank(
+    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
+    //     0);
+    // int32_t* hist_sum_local =
+    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
+    // if (local_tid < NUM_EXPERTS)
+    //     hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
+    // cluster.sync();
 
     // Phase 3: Write gate_scale, topk_index, gate_index using the computed topk
     // results Read directly from global memory since Phase 0+1 already wrote
