@@ -131,7 +131,35 @@ template <int n>
 __device__ inline void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 }
-
+template <int NUM_EXPERTS>
+__forceinline__ __device__ void collect_hist_allgather(
+    cooperative_groups::cluster_group& cluster,
+    int32_t* __restrict__ local_hist,     // 本 CTA 的 smem histogram
+    int32_t* __restrict__ global_hist) {  // 输出: 本 CTA smem 中的聚合结果
+    
+    auto cta_rank = cluster.block_rank();
+    auto cluster_size = cluster.num_blocks();
+    auto tid = threadIdx.x;
+    
+    // Step 0: 确保所有 CTA 的 local_hist 已经写完
+    // cluster.sync();  // ← 唯一一次 sync
+    
+    // Step 1: 每个 CTA 独立读所有 partner 的 hist, 本地求和
+    if (tid < NUM_EXPERTS) {
+        int32_t sum = local_hist[tid];  // 先加自己的
+        
+        #pragma unroll
+        for (int r = 0; r < cluster_size; r++) {  // 注意不是 cluster_size-1
+            if (r != cta_rank) {
+                int32_t* partner_hist = cluster.map_shared_rank(local_hist, r);
+                sum += partner_hist[tid];
+            }
+        }
+        global_hist[tid] = sum;
+    }
+    // 不需要 restore，因为 local_hist 没被修改
+    // 不需要额外 sync，因为每个 CTA 已经有完整的 global_hist
+}
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void collect_hist(
     typename cooperative_groups::cluster_group& handle,
@@ -159,7 +187,39 @@ __forceinline__ __device__ void collect_hist(
     if (cta_rank == 0 && tid < NUM_EXPERTS) global_hist[tid] = hist[tid];
     if (tid < NUM_EXPERTS) hist[tid] = hist_buffer[tid];  // restore
 }
-
+template <int NUM_EXPERTS>
+__forceinline__ __device__ void collect_and_prefix_hist(
+    cooperative_groups::cluster_group& cluster,
+    int32_t* __restrict__ local_hist,      // 本 CTA 的 local histogram
+    int32_t* __restrict__ global_hist,     // 输出: 全局 histogram
+    int32_t* __restrict__ prior_contrib) { // 输出: 本 CTA 之前所有 CTA 的 hist 之和
+    
+    auto cta_rank = cluster.block_rank();
+    auto cluster_size = cluster.num_blocks();
+    auto tid = threadIdx.x;
+    
+    if (tid < NUM_EXPERTS) {
+        int32_t sum = local_hist[tid];     // global sum: 从自己开始
+        int32_t prefix = 0;                // prefix: 从 0 开始 (exclusive)
+        
+        #pragma unroll
+        for (int r = 0; r < cluster_size; r++) {
+            if (r == cta_rank) continue;
+            
+            int32_t* partner_hist = cluster.map_shared_rank(local_hist, r);
+            int32_t val = partner_hist[tid];  // ← 一次 DSMEM read, 两处复用
+            
+            sum += val;
+            if (r < cta_rank) {
+                prefix += val;
+            }
+        }
+        
+        global_hist[tid] = sum;
+        prior_contrib[tid] = prefix;
+    }
+    // 无需 sync, 无需 restore
+}
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void prefix_hist_CTA(
     cooperative_groups::cluster_group& handle, int32_t* __restrict__ hist,
@@ -967,15 +1027,15 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
     cluster.sync();
     int32_t* global_hist =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
+    collect_and_prefix_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
 
     /*===========================================phase 2*/
     int warp_id = threadIdx.x / 32;
     // compute expert_across_prefixsum, dst_experts[i] =
     // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
-    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
-                                 sm_hist + expert_across_offset);
-    cluster.sync();
+    // prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
+    //                              sm_hist + expert_across_offset);
+    // cluster.sync();
     if (CTA_ID == 0 && warp_id < NUM_BLOCK_SIZES) {
         int32_t* global_hist_sm0 =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
