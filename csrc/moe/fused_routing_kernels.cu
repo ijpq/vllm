@@ -1003,8 +1003,8 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 #pragma unroll
             for (int k = 0; k < topk; k++) {
                 int expert_id = topk_indices_local[k];
-                int expert_offset = atomicAdd(hist_ptr + expert_id, 1);
-                local_offset_sm[layout_addr(local_i, k)] = expert_offset;
+               local_offset_sm[layout_addr(local_i, k)] =  atomicAdd(hist_ptr + expert_id, 1);
+                
                 topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
                 topk_indices_ptr[local_i * topk + k] = expert_id;
@@ -1015,7 +1015,6 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 
 // Build histogram and local offsets
         }
-        __syncthreads();  // Sync before next iteration
     }
     cluster.sync();
     // int32_t* global_hist =
@@ -1033,28 +1032,25 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     // prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
     //                              sm_hist + expert_across_offset);
     // cluster.sync();
+            int32_t* hist_sum = reinterpret_cast<int32_t*>(
+                sm_hist + global_hist_exclusivesum_offset);
     if (warp_id == 0) {
-        int lane_id = threadIdx.x % 32;
         int h = hist_ptr[lane_id];
         // compute global hist prefixsum
-        {
             int exclusive_res = 0;
             int warp_reduce = 0;
             WarpScan(temp_storage_hist[0])
                 .ExclusiveSum(h, exclusive_res, warp_reduce);
-            int32_t* hist_sum = reinterpret_cast<int32_t*>(
-                sm_hist + global_hist_exclusivesum_offset);
             hist_sum[local_tid] = exclusive_res;
             if (local_tid == 0) hist_sum[NUM_EXPERTS] = warp_reduce;
-        }
 
         // align the data with triton's matmul_ogs
         // block_m_param is passed as a kernel parameter at runtime
         int32_t* pid_map_row =
             reinterpret_cast<int32_t*>(sm_hist + block_pid_offset);
         int n_tiles = (h + block_m_param - 1) / block_m_param;
-        int warp_reduce = 0;
-        int exclusive_res = 0;
+         warp_reduce = 0;
+         exclusive_res = 0;
         WarpScan(temp_storage_tiles[0])
             .ExclusiveSum(n_tiles, exclusive_res, warp_reduce);
 
@@ -1088,12 +1084,9 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
             block_pid_map_ptr[i] = block_pid[i];
     }
     if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
-        int32_t* hist_sum = reinterpret_cast<int32_t*>(
-            sm_hist + global_hist_exclusivesum_offset);
         int32_t* global_hist_sm =
             reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
-        hist_ptr[local_tid] = global_hist_sm[local_tid];
         if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
     // cluster.sync();
@@ -1107,8 +1100,6 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     // int32_t* hist_sum_sm0 = cluster.map_shared_rank(
     //     reinterpret_cast<int32_t*>(sm_hist +
     //     global_hist_exclusivesum_offset), 0);
-    int32_t* hist_sum_local =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
     // if (local_tid < NUM_EXPERTS)
     //     hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
     // cluster.sync();
@@ -1122,12 +1113,9 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 
         for (int k = 0; k < topk; k++) {
             int expert_id = topk_indices_ptr[local_i * topk + k];
-            // if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
             InValDtype val = topk_weights_ptr[local_i * topk + k];
             int flat_idx = i * topk + k;
-            int expert_base = hist_sum_local[expert_id];
-            // int expert_prior = prior_contrib[expert_id];
-            // int expert_local_offset = local_offset_sm[local_i * topk + k];
+            int expert_base = hist_sum[expert_id];
             int expert_local = local_offset_sm[layout_addr(local_i, k)];
 
             int global_pos = expert_base + expert_local;
@@ -1135,7 +1123,6 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
             gate_scale[global_pos] = static_cast<OutValDtype>(val);
             topk_index[global_pos] = flat_idx;
             gate_index[flat_idx] = global_pos;
-            // }
         }
     }
 }
