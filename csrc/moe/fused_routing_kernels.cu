@@ -134,21 +134,21 @@ __device__ inline void cp_async_wait() {
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void collect_hist_allgather(
     cooperative_groups::cluster_group& cluster,
-    int32_t* __restrict__ local_hist,     // 本 CTA 的 smem histogram
+    int32_t* __restrict__ local_hist,  // 本 CTA 的 smem histogram
     int32_t* __restrict__ global_hist) {  // 输出: 本 CTA smem 中的聚合结果
-    
+
     auto cta_rank = cluster.block_rank();
     auto cluster_size = cluster.num_blocks();
     auto tid = threadIdx.x;
-    
+
     // Step 0: 确保所有 CTA 的 local_hist 已经写完
     // cluster.sync();  // ← 唯一一次 sync
-    
+
     // Step 1: 每个 CTA 独立读所有 partner 的 hist, 本地求和
     if (tid < NUM_EXPERTS) {
         int32_t sum = local_hist[tid];  // 先加自己的
-        
-        #pragma unroll
+
+#pragma unroll
         for (int r = 0; r < cluster_size; r++) {  // 注意不是 cluster_size-1
             if (r != cta_rank) {
                 int32_t* partner_hist = cluster.map_shared_rank(local_hist, r);
@@ -190,31 +190,32 @@ __forceinline__ __device__ void collect_hist(
 template <int NUM_EXPERTS>
 __forceinline__ __device__ void collect_and_prefix_hist(
     cooperative_groups::cluster_group& cluster,
-    int32_t* __restrict__ local_hist,      // 本 CTA 的 local histogram
-    int32_t* __restrict__ global_hist,     // 输出: 全局 histogram
-    int32_t* __restrict__ prior_contrib) { // 输出: 本 CTA 之前所有 CTA 的 hist 之和
-    
+    int32_t* __restrict__ local_hist,   // 本 CTA 的 local histogram
+    int32_t* __restrict__ global_hist,  // 输出: 全局 histogram
+    int32_t* __restrict__ prior_contrib) {  // 输出: 本 CTA 之前所有 CTA 的 hist
+                                            // 之和
+
     auto cta_rank = cluster.block_rank();
     auto cluster_size = cluster.num_blocks();
     auto tid = threadIdx.x;
-    
+
     if (tid < NUM_EXPERTS) {
-        int32_t sum = local_hist[tid];     // global sum: 从自己开始
-        int32_t prefix = 0;                // prefix: 从 0 开始 (exclusive)
-        
-        #pragma unroll
+        int32_t sum = local_hist[tid];  // global sum: 从自己开始
+        int32_t prefix = 0;             // prefix: 从 0 开始 (exclusive)
+
+#pragma unroll
         for (int r = 0; r < cluster_size; r++) {
             if (r == cta_rank) continue;
-            
+
             int32_t* partner_hist = cluster.map_shared_rank(local_hist, r);
             int32_t val = partner_hist[tid];  // ← 一次 DSMEM read, 两处复用
-            
+
             sum += val;
             if (r < cta_rank) {
                 prefix += val;
             }
         }
-        
+
         global_hist[tid] = sum;
         prior_contrib[tid] = prefix;
     }
@@ -787,11 +788,8 @@ __global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
             int32_t* token_offs_pad =
                 reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
             if (local_tid < NUM_EXPERTS) {
-                token_offs_pad[local_tid] =
-                    tiles_exclusive_res;
-                if (local_tid == 0)
-                    token_offs_pad[NUM_EXPERTS] =
-                        tiles_reduce;
+                token_offs_pad[local_tid] = tiles_exclusive_res;
+                if (local_tid == 0) token_offs_pad[NUM_EXPERTS] = tiles_reduce;
                 int tile_start = tiles_exclusive_res;
                 for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
                     int packed_val = (block_idx << 16) | local_tid;
@@ -928,8 +926,8 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
         typename WarpScan::TempStorage temp_storage_tiles[NUM_BLOCK_SIZES];
     extern __shared__ __align__(16) int32_t sm_hist[];
     int topk_indices_sm_size = topk_padded * ROWS_PER_CTA;
-    int topk_weights_sm_size = topk_padded * ROWS_PER_CTA *
-                               sizeof(InValDtype) / sizeof(int32_t);
+    int topk_weights_sm_size =
+        topk_padded * ROWS_PER_CTA * sizeof(InValDtype) / sizeof(int32_t);
     int global_hist_offset = 0;
     int local_hist_offset = NUM_EXPERTS;
     int global_hist_exclusivesum_offset = local_hist_offset + NUM_EXPERTS;
@@ -947,7 +945,8 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     int topk_weights_offset =
         topk_indices_offset + topk_indices_sm_size + padding_weights;
     int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
-    __nv_bfloat16* topk_weights_ptr = reinterpret_cast<__nv_bfloat16*>(sm_hist + topk_weights_offset);
+    __nv_bfloat16* topk_weights_ptr =
+        reinterpret_cast<__nv_bfloat16*>(sm_hist + topk_weights_offset);
     int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
 
 #pragma unroll
@@ -961,7 +960,8 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
          i += blockDim.x) {
         sm_hist[block_pid_offset + i] = -1;
     }
-    // cluster.sync();  // we need to ensure global hist in CTA0 had been memset.
+    // cluster.sync();  // we need to ensure global hist in CTA0 had been
+    // memset.
 
     /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
     int32_t* local_hist =
@@ -1002,31 +1002,29 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 
 #pragma unroll
             for (int k = 0; k < topk; k++) {
+                int expert_id = topk_indices_local[k];
+                int expert_offset = atomicAdd(hist_ptr + expert_id, 1);
+                local_offset_sm[layout_addr(local_i, k)] = expert_offset;
                 topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices_ptr[local_i * topk + k] = topk_indices_local[k];
+                topk_indices_ptr[local_i * topk + k] = expert_id;
             }
 
             // Note: Shared memory writes for indices_ptr removed since
             // Phase 3 now reads directly from global memory.
 
 // Build histogram and local offsets
-#pragma unroll
-            for (int k = 0; k < topk; k++) {
-                int expert_id = topk_indices_local[k];
-                local_offset_sm[layout_addr(local_i, k)] =
-                    atomicAdd(local_hist + expert_id, 1);
-            }
         }
         __syncthreads();  // Sync before next iteration
     }
     cluster.sync();
-    int32_t* global_hist =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    int32_t* prior_contrib =
-        reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
-    collect_and_prefix_hist<NUM_EXPERTS>(cluster, local_hist, global_hist,  prior_contrib);
-    __syncthreads();
+    // int32_t* global_hist =
+    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
+    // int32_t* prior_contrib =
+    //     reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
+    // collect_and_prefix_hist<NUM_EXPERTS>(cluster, local_hist, global_hist,
+    //                                      prior_contrib);
+    // __syncthreads();
 
     /*===========================================phase 2*/
     int warp_id = threadIdx.x / 32;
@@ -1037,7 +1035,7 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     // cluster.sync();
     if (warp_id == 0) {
         int lane_id = threadIdx.x % 32;
-        int h = global_hist[lane_id];
+        int h = hist_ptr[lane_id];
         // compute global hist prefixsum
         {
             int exclusive_res = 0;
@@ -1063,8 +1061,7 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
         int32_t* token_offs_pad =
             reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
         token_offs_pad[lane_id] = exclusive_res;
-        if (lane_id == 0)
-            token_offs_pad[NUM_EXPERTS] = warp_reduce;
+        if (lane_id == 0) token_offs_pad[NUM_EXPERTS] = warp_reduce;
 
         int tile_start = exclusive_res;
         for (int block_idx = 0; block_idx < n_tiles; block_idx++) {
@@ -1103,14 +1100,13 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 
     /*=============================================phase 3*/
 
-
     /*
     WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
     cudaErrorLaunchFailure.
     */
     // int32_t* hist_sum_sm0 = cluster.map_shared_rank(
-    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
-    //     0);
+    //     reinterpret_cast<int32_t*>(sm_hist +
+    //     global_hist_exclusivesum_offset), 0);
     int32_t* hist_sum_local =
         reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
     // if (local_tid < NUM_EXPERTS)
@@ -1126,19 +1122,20 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 
         for (int k = 0; k < topk; k++) {
             int expert_id = topk_indices_ptr[local_i * topk + k];
-            if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                InValDtype val = topk_weights_ptr[local_i * topk + k];
-                int flat_idx = i * topk + k;
-                int expert_base = hist_sum_local[expert_id];
-                int expert_prior = prior_contrib[expert_id];
-                int expert_local = local_offset_sm[layout_addr(local_i, k)];
+            // if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+            InValDtype val = topk_weights_ptr[local_i * topk + k];
+            int flat_idx = i * topk + k;
+            int expert_base = hist_sum_local[expert_id];
+            // int expert_prior = prior_contrib[expert_id];
+            // int expert_local_offset = local_offset_sm[local_i * topk + k];
+            int expert_local = local_offset_sm[layout_addr(local_i, k)];
 
-                int global_pos = expert_base + expert_prior + expert_local;
+            int global_pos = expert_base + expert_local;
 
-                gate_scale[global_pos] = static_cast<OutValDtype>(val);
-                topk_index[global_pos] = flat_idx;
-                gate_index[flat_idx] = global_pos;
-            }
+            gate_scale[global_pos] = static_cast<OutValDtype>(val);
+            topk_index[global_pos] = flat_idx;
+            gate_index[flat_idx] = global_pos;
+            // }
         }
     }
 }
@@ -1328,13 +1325,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaLaunchKernelEx(&config, kernel_wrapper, router_logits_ptr,
-                               topk_weights_ptr, topk_indices_ptr, max_n_tiles,
-                               num_tokens, gate_scale_ptr, topk_index_ptr,
-                               gate_index_ptr, token_offs_pad_ptr,
-                               block_pid_map_ptr, expt_offs_ptr, hist_ptr,
-                               padding_indices, padding_weights,
-                               static_cast<int>(block_m));
+            cudaLaunchKernelEx(
+                &config, kernel_wrapper, router_logits_ptr, topk_weights_ptr,
+                topk_indices_ptr, max_n_tiles, num_tokens, gate_scale_ptr,
+                topk_index_ptr, gate_index_ptr, token_offs_pad_ptr,
+                block_pid_map_ptr, expt_offs_ptr, hist_ptr, padding_indices,
+                padding_weights, static_cast<int>(block_m));
             break;
         }
         case 128: {
@@ -1490,13 +1486,12 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto expt_offs_ptr = expt_offs.data_ptr<int32_t>();
             auto hist_ptr = hist.data_ptr<int32_t>();
 
-            cudaLaunchKernelEx(&config, kernel_wrapper, router_logits_ptr,
-                               topk_weights_ptr, topk_indices_ptr, max_n_tiles,
-                               num_tokens, gate_scale_ptr, topk_index_ptr,
-                               gate_index_ptr, token_offs_pad_ptr,
-                               block_pid_map_ptr, expt_offs_ptr, hist_ptr,
-                               padding_indices, padding_weights,
-                               static_cast<int>(block_m));
+            cudaLaunchKernelEx(
+                &config, kernel_wrapper, router_logits_ptr, topk_weights_ptr,
+                topk_indices_ptr, max_n_tiles, num_tokens, gate_scale_ptr,
+                topk_index_ptr, gate_index_ptr, token_offs_pad_ptr,
+                block_pid_map_ptr, expt_offs_ptr, hist_ptr, padding_indices,
+                padding_weights, static_cast<int>(block_m));
             break;
         }
             TORCH_CHECK(false, "Unsupported num experts: ", num_experts);
