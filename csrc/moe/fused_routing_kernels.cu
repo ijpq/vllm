@@ -1027,7 +1027,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
                 int expert_local_offset = atomicAdd(hist_ptr + expert_id, 1);
 
                 // 保存到 shared memory，Phase 3 使用
-                local_offset_sm[local_i * topk + k] = expert_local_offset;
+                local_offset_sm[layout_addr(local_i, k)] = expert_local_offset;
                 topk_indices_ptr[local_i * topk + k] = expert_id;
                 topk_weights_ptr[local_i * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
@@ -1109,6 +1109,8 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             reinterpret_cast<int32_t*>(sm_hist + token_offs_pad_offset);
         int32_t* block_pid =
             reinterpret_cast<int32_t*>(sm_hist + block_pid_offset);
+        if (CTA_ID == 0) {
+
         for (int i = local_tid; i < token_offs_pad_size; i += blockDim.x)
             token_offs_pad_ptr[i] = token_offs_pad[i];
         for (int i = local_tid; i < pid_map_size; i += blockDim.x)
@@ -1119,6 +1121,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
             expt_offs_ptr[local_tid] = hist_sum[local_tid];
             if (local_tid == 0)
                 expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
+        }
         }
     // }  // end if (CTA_ID == 0)
 
@@ -1144,7 +1147,7 @@ __global__ void fused_routing_kernel<32, 4, 4, __nv_bfloat16, __nv_bfloat16>(
         for (int k = 0; k < topk; k++) {
             int expert_id = topk_indices_ptr[local_i * topk + k];
             InValDtype val = topk_weights_ptr[local_i * topk + k];
-            int expert_local_offset = local_offset_sm[local_i * topk + k];
+            int expert_local_offset = local_offset_sm[layout_addr(local_i, k)];
             int flat_idx = i * topk + k;
 
             // 二级寻址: expt_offs[expert] + expert 内全局偏移
