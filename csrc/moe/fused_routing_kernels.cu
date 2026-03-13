@@ -960,8 +960,6 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
          i += blockDim.x) {
         sm_hist[block_pid_offset + i] = -1;
     }
-    // cluster.sync();  // we need to ensure global hist in CTA0 had been
-    // memset.
 
     /*phase 0 + phase 1: Compute topk+softmax inline and build histograms*/
     int32_t* local_hist =
@@ -1010,28 +1008,12 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
                 topk_indices_ptr[local_i * topk + k] = expert_id;
             }
 
-            // Note: Shared memory writes for indices_ptr removed since
-            // Phase 3 now reads directly from global memory.
-
-// Build histogram and local offsets
         }
     }
     cluster.sync();
-    // int32_t* global_hist =
-    //     reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    // int32_t* prior_contrib =
-    //     reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
-    // collect_and_prefix_hist<NUM_EXPERTS>(cluster, local_hist, global_hist,
-    //                                      prior_contrib);
-    // __syncthreads();
 
     /*===========================================phase 2*/
     int warp_id = threadIdx.x / 32;
-    // compute expert_across_prefixsum, dst_experts[i] =
-    // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
-    // prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
-    //                              sm_hist + expert_across_offset);
-    // cluster.sync();
             int32_t* hist_sum = reinterpret_cast<int32_t*>(
                 sm_hist + global_hist_exclusivesum_offset);
     if (warp_id == 0) {
@@ -1065,8 +1047,6 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
             pid_map_row[(tile_start + block_idx)] = packed_val;
         }
     }
-    // topk_weights already written to global memory in Phase 0+1
-    // cluster.sync();
 
     // WB global memory
     int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
@@ -1089,24 +1069,9 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
         if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
-    // cluster.sync();
 
-    /*=============================================phase 3*/
 
-    /*
-    WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
-    cudaErrorLaunchFailure.
-    */
-    // int32_t* hist_sum_sm0 = cluster.map_shared_rank(
-    //     reinterpret_cast<int32_t*>(sm_hist +
-    //     global_hist_exclusivesum_offset), 0);
-    // if (local_tid < NUM_EXPERTS)
-    //     hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
-    // cluster.sync();
 
-    // Phase 3: Write gate_scale, topk_index, gate_index using the computed topk
-    // results Read directly from global memory since Phase 0+1 already wrote
-    // topk_weights and topk_indices there
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
