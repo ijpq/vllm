@@ -663,6 +663,9 @@ __global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
         local_offset_offset + local_offset_size + padding_indices;
     int topk_weights_offset =
         topk_indices_offset + topk_indices_sm_size + padding_weights;
+    __nv_bfloat16* topk_weights_ptr =
+        reinterpret_cast<__nv_bfloat16*>(sm_hist + topk_weights_offset);
+    int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
     int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
 
 #pragma unroll
@@ -727,45 +730,27 @@ __global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 // Write to global memory
 #pragma unroll
             for (int k = 0; k < topk; k++) {
-                topk_weights[current_row * topk + k] =
+                int expert_id = topk_indices_local[k];
+                topk_weights_ptr[current_row * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices[current_row * topk + k] = topk_indices_local[k];
+                topk_indices_ptr[current_row * topk + k] = expert_id;
+                local_offset_sm[layout_addr(local_i, k)] =
+                    atomicAdd(hist_ptr + expert_id, 1);
             }
 
             // Note: Shared memory writes for indices_ptr removed since
             // Phase 3 now reads directly from global memory.
 
 // Build histogram and local offsets
-#pragma unroll
-            for (int k = 0; k < topk; k++) {
-                int expert_id = topk_indices_local[k];
-                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                    local_offset_sm[layout_addr(local_i, k)] =
-                        atomicAdd(local_hist + expert_id, 1);
-                }
-            }
         }
-        __syncthreads();  // Sync before next iteration
     }
     cluster.sync();
-    int32_t* global_hist =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-    collect_hist<NUM_EXPERTS>(cluster, local_hist, global_hist);
-    /* phase 2*/
-    // compute expert_across_prefixsum, dst_experts[i] =
-    // sum_{p=0}^{j-1}{local_hist[p]}, where i is expert_id, j is CTA_ID
-    prefix_hist_CTA<NUM_EXPERTS>(cluster, sm_hist + local_hist_offset,
-                                 sm_hist + expert_across_offset);
-    cluster.sync();
-    int h = 0;
     // Note: lane_id and warp_id_local already defined above for topk+softmax
-    if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
-        int32_t* global_hist_sm0 =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
-        h = global_hist_sm0[local_tid];
-    }
     if (CTA_ID == 0) {
         // compute global hist prefixsum
+        int h = 0;
+        if (local_tid < NUM_EXPERTS)
+            int h = hist_ptr[local_tid];
         int block_exclusive_res = 0;
         int block_reduce = 0;
         BlockScan(temp_storage_hist)
@@ -797,9 +782,8 @@ __global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
                 }
             }
         }
+    __syncthreads();
     }
-    // topk_weights already written to global memory in Phase 0+1
-    cluster.sync();
 
     // WB global memory
     int token_offs_pad_size = NUM_BLOCK_SIZES * (NUM_EXPERTS + 1);
@@ -818,60 +802,37 @@ __global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
         int32_t* hist_sum = reinterpret_cast<int32_t*>(
             sm_hist + global_hist_exclusivesum_offset);
-        int32_t* global_hist_sm =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
-        hist_ptr[local_tid] = global_hist_sm[local_tid];
         if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
-    cluster.sync();
 
     /* phase 3*/
 
     int32_t* prior_contrib =
         reinterpret_cast<int32_t*>(sm_hist + expert_across_offset);
 
-    /*
-    WE HAVE TO SYNC TO CTA'S LOCAL SM SINCE MAP_SHARED_RANK LEADS TO
-    cudaErrorLaunchFailure.
-    */
-    int32_t* hist_sum_sm0 = cluster.map_shared_rank(
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset),
-        0);
-    int32_t* hist_sum_local =
-        reinterpret_cast<int32_t*>(sm_hist + global_hist_exclusivesum_offset);
-    if (local_tid < NUM_EXPERTS)
-        hist_sum_local[local_tid] = hist_sum_sm0[local_tid];
-    cluster.sync();
-
     // Phase 3: Write gate_scale, topk_index, gate_index using the computed topk
     // results Read directly from global memory since Phase 0+1 already wrote
     // topk_weights and topk_indices there
+    int32_t* hist_sum = reinterpret_cast<int32_t*>(
+        sm_hist + global_hist_exclusivesum_offset);
 #pragma unroll
     for (int i = row + local_tid; i < row_end; i += blockDim.x) {
         int local_i = i - row;
 
         // Load topk results from global memory
         for (int k = 0; k < topk; k++) {
-            if (i >= 0 && i < NUM_TOKENS) {
-                int expert_id = topk_indices[i * topk + k];
-                if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-                    InValDtype val = topk_weights[i * topk + k];
+                int expert_id = topk_indices_ptr[local_i * topk + k];
+                    InValDtype val = topk_weights[local_i * topk + k];
                     int flat_idx = i * topk + k;
-                    int expert_base = hist_sum_local[expert_id];
-                    int expert_prior = prior_contrib[expert_id];
+                    int expert_base = hist_sum[expert_id];
                     int expert_local = local_offset_sm[layout_addr(local_i, k)];
 
-                    int global_pos = expert_base + expert_prior + expert_local;
+                    int global_pos = expert_base + expert_local;
 
-                    if (global_pos < NUM_TOKENS * topk &&
-                        flat_idx < NUM_TOKENS * topk) {
                         gate_scale[global_pos] = static_cast<OutValDtype>(val);
                         topk_index[global_pos] = flat_idx;
                         gate_index[flat_idx] = global_pos;
-                    }
-                }
-            }
         }
     }
 }
@@ -944,10 +905,10 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
         local_offset_offset + local_offset_size + padding_indices;
     int topk_weights_offset =
         topk_indices_offset + topk_indices_sm_size + padding_weights;
-    int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
     __nv_bfloat16* topk_weights_ptr =
         reinterpret_cast<__nv_bfloat16*>(sm_hist + topk_weights_offset);
     int32_t* topk_indices_ptr = sm_hist + topk_indices_offset;
+    int shared_mem_size = topk_weights_offset + topk_weights_sm_size;
 
 #pragma unroll
     for (int i = local_tid; i < shared_mem_size; i += blockDim.x) {
@@ -986,36 +947,37 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     for (int iter_base = row; iter_base < row_end; iter_base += ROWS_PER_ITER) {
         int current_row = iter_base + row_in_iter;
         int local_i = current_row - row;
+        bool valid_row = (current_row < row_end);
 
         // Temporary storage for topk results
         float topk_weights_f[topk];
         int32_t topk_indices_local[topk];
 
-        if (current_row < row_end) {
-            // Compute topk+softmax for this row (each thread handles one row
-            // independently)
-            compute_topk_softmax_row<NUM_EXPERTS, THREADS_PER_ROW_TOPK>(
-                router_logits + current_row * NUM_EXPERTS, topk_weights_f,
-                topk_indices_local, thread_group_idx, lane_id, warp_id_local);
+        // Compute topk+softmax for this row (each thread handles one row
+        // independently)
+        int safe_row = valid_row ? current_row : row;
+        compute_topk_softmax_row<NUM_EXPERTS, THREADS_PER_ROW_TOPK>(
+            router_logits + safe_row * NUM_EXPERTS, topk_weights_f,
+            topk_indices_local, thread_group_idx, lane_id, warp_id_local);
 
+        if (valid_row && thread_group_idx == 0) {
 #pragma unroll
             for (int k = 0; k < topk; k++) {
                 int expert_id = topk_indices_local[k];
-               local_offset_sm[layout_addr(local_i, k)] =  atomicAdd(hist_ptr + expert_id, 1);
+                local_offset_sm[layout_addr(local_i, k)] =  atomicAdd(hist_ptr + expert_id, 1);
                 
-                topk_weights_ptr[local_i * topk + k] =
+                topk_weights_ptr[current_row * topk + k] =
                     static_cast<InValDtype>(topk_weights_f[k]);
-                topk_indices_ptr[local_i * topk + k] = expert_id;
+                topk_indices_ptr[current_row * topk + k] = expert_id;
             }
 
-        }
     }
     cluster.sync();
 
     /*===========================================phase 2*/
     int warp_id = threadIdx.x / 32;
-            int32_t* hist_sum = reinterpret_cast<int32_t*>(
-                sm_hist + global_hist_exclusivesum_offset);
+    int32_t* hist_sum = reinterpret_cast<int32_t*>(
+        sm_hist + global_hist_exclusivesum_offset);
     if (warp_id == 0) {
         int h = hist_ptr[lane_id];
         // compute global hist prefixsum
@@ -1064,12 +1026,9 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
             block_pid_map_ptr[i] = block_pid[i];
     }
     if (CTA_ID == 0 && local_tid < NUM_EXPERTS) {
-        int32_t* global_hist_sm =
-            reinterpret_cast<int32_t*>(sm_hist + global_hist_offset);
         expt_offs_ptr[local_tid] = hist_sum[local_tid];
         if (local_tid == 0) expt_offs_ptr[NUM_EXPERTS] = hist_sum[NUM_EXPERTS];
     }
-
 
 
 #pragma unroll
