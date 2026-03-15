@@ -840,8 +840,6 @@ __global__ void fused_routing_kernel<128, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 template <>
 __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
     const __nv_bfloat16* __restrict__ router_logits,  // [NUM_TOKENS, 32]
-    __nv_bfloat16* __restrict__ topk_weights,         // [NUM_TOKENS, 4] output
-    int32_t* __restrict__ topk_indices,               // [NUM_TOKENS, 4] output
     const int64_t max_n_tiles, const int64_t NUM_TOKENS,
     __nv_bfloat16* __restrict__ gate_scale, int32_t* __restrict__ topk_index,
     int32_t* __restrict__ gate_index, int32_t* __restrict__ token_offs_pad_ptr,
@@ -1056,8 +1054,7 @@ __global__ void fused_routing_kernel<32, 4, 1, __nv_bfloat16, __nv_bfloat16>(
 
 template <typename IdxType, typename InValType, typename OutValType>
 void routing_kernel_helper(torch::Tensor& gating_output,
-                           torch::Tensor& topk_weights,
-                           torch::Tensor& topk_indices, int64_t max_n_tiles,
+                            int64_t max_n_tiles,
                            int64_t topk, torch::Tensor& gate_scale,
                            torch::Tensor& topk_index, torch::Tensor& gate_index,
                            torch::Tensor& token_offs_pad,
@@ -1224,11 +1221,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
 
             auto router_logits_ptr =
                 reinterpret_cast<const InValType*>(gating_output.data_ptr());
-            auto topk_weights_ptr =
-                reinterpret_cast<InValType*>(topk_weights.data_ptr());
             auto gate_scale_ptr =
                 reinterpret_cast<OutValType*>(gate_scale.data_ptr());
-            auto topk_indices_ptr = topk_indices.data_ptr<IdxType>();
             auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
@@ -1237,8 +1231,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto hist_ptr = hist.data_ptr<int32_t>();
 
             cudaLaunchKernelEx(
-                &config, kernel_wrapper, router_logits_ptr, topk_weights_ptr,
-                topk_indices_ptr, max_n_tiles, num_tokens, gate_scale_ptr,
+                &config, kernel_wrapper, router_logits_ptr, 
+                 max_n_tiles, num_tokens, gate_scale_ptr,
                 topk_index_ptr, gate_index_ptr, token_offs_pad_ptr,
                 block_pid_map_ptr, expt_offs_ptr, hist_ptr, padding_indices,
                 padding_weights, static_cast<int>(block_m));
@@ -1385,11 +1379,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
 
             auto router_logits_ptr =
                 reinterpret_cast<const InValType*>(gating_output.data_ptr());
-            auto topk_weights_ptr =
-                reinterpret_cast<InValType*>(topk_weights.data_ptr());
             auto gate_scale_ptr =
                 reinterpret_cast<OutValType*>(gate_scale.data_ptr());
-            auto topk_indices_ptr = topk_indices.data_ptr<IdxType>();
             auto topk_index_ptr = topk_index.data_ptr<int32_t>();
             auto gate_index_ptr = gate_index.data_ptr<int32_t>();
             auto token_offs_pad_ptr = token_offs_pad.data_ptr<int32_t>();
@@ -1398,8 +1389,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
             auto hist_ptr = hist.data_ptr<int32_t>();
 
             cudaLaunchKernelEx(
-                &config, kernel_wrapper, router_logits_ptr, topk_weights_ptr,
-                topk_indices_ptr, max_n_tiles, num_tokens, gate_scale_ptr,
+                &config, kernel_wrapper, router_logits_ptr, 
+                 max_n_tiles, num_tokens, gate_scale_ptr,
                 topk_index_ptr, gate_index_ptr, token_offs_pad_ptr,
                 block_pid_map_ptr, expt_offs_ptr, hist_ptr, padding_indices,
                 padding_weights, static_cast<int>(block_m));
@@ -1409,8 +1400,8 @@ void routing_kernel_helper(torch::Tensor& gating_output,
     }
 }
 
-void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
-                   torch::Tensor& topk_indices, int64_t max_n_tiles,
+void fused_routing(torch::Tensor& gating_output,
+                    int64_t max_n_tiles,
                    int64_t topk, torch::Tensor& gate_scale,
                    torch::Tensor& topk_index, torch::Tensor& gate_index,
                    torch::Tensor& token_offs_pad, torch::Tensor& block_pid_map,
@@ -1419,23 +1410,17 @@ void fused_routing(torch::Tensor& gating_output, torch::Tensor& topk_weights,
     /*
     dispatch dtype
     */
-    if (topk_indices.scalar_type() == at::ScalarType::Int &&
-        gate_scale.scalar_type() == at::ScalarType::BFloat16 &&
-        topk_weights.scalar_type() == at::ScalarType::BFloat16) {
+    if (
+        gate_scale.scalar_type() == at::ScalarType::BFloat16 
+        ) {
         int int4_alignment = 16;
         int float16_alignment = 8;
-        if ((reinterpret_cast<uintptr_t>(topk_indices.data_ptr()) %
-             int4_alignment) != 0)
-            TORCH_CHECK(false, "");
-        if ((reinterpret_cast<uintptr_t>(topk_weights.data_ptr()) %
-             float16_alignment) != 0)
-            TORCH_CHECK(false, "");
         routing_kernel_helper<int32_t, __nv_bfloat16, __nv_bfloat16>(
-            gating_output, topk_weights, topk_indices, max_n_tiles, topk,
+            gating_output,  max_n_tiles, topk,
             gate_scale, topk_index, gate_index, token_offs_pad, block_pid_map,
             expt_offs, hist, block_m);
     } else {
-        TORCH_CHECK(false, "Unsupported dtype: ", topk_indices.scalar_type(),
+        TORCH_CHECK(false, "Unsupported dtype: ", 
                     gate_scale.scalar_type());
     }
 }

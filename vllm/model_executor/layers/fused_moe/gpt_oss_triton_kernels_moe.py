@@ -99,12 +99,6 @@ def fused_routing(
     M, N = router_logits.shape
     device = router_logits.device
 
-    topk_weights = torch.empty((M, topk), device=device, dtype=torch.float32) 
-    topk_indices = torch.empty((M, topk), device=device, dtype=torch.int) 
-    token_expert_indices = torch.empty(
-        (M, topk), dtype=torch.int32, device=device
-    )
-
     hist = torch.zeros(N, device=device, dtype=torch.int32)
     expt_offs = torch.empty(N + 1, device=device, dtype=torch.int32)
 
@@ -136,16 +130,8 @@ def fused_routing(
     )
 
 
-    # XXX: Since we have fused topk+softmax kernel, leave it outside
-    # ops.topk_softmax(
-    #     topk_weights, topk_indices, token_expert_indices, router_logits, renormalize
-    # )
-    topk_weights = topk_weights.to(router_logits.dtype).contiguous()  
-    topk_indices = topk_indices.contiguous()
     ops.fused_routing(
         router_logits,
-        topk_weights,
-        topk_indices,
         max_n_tiles,
         topk,
         gate_scale,
